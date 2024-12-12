@@ -1,5 +1,8 @@
 #!/bin/bash
 
+export PT_HPU_LAZY_MODE=0
+export PT_HPU_GPU_MIGRATION=1
+
 # Default values
 MODEL="facebook/opt-1.3b"
 BS=16
@@ -8,13 +11,13 @@ TRAIN=1000
 DEV=500
 EVAL=1000
 STEPS=20000
-EVAL_STEPS=4000
+EVAL_STEPS=100
 MODE="ft"
 TASK="SST2"
 SEED=0
 RANK=1
 STEP_INTERVAL=100
-Trainer="LOZO-Adam"
+Trainer="KFAC-LOZO-Adam"
 LR=1e-4
 SAVE_STEPS=1000
 
@@ -85,6 +88,7 @@ python run.py \
     --train_as_classification \
     --step_interval $STEP_INTERVAL \
     --rank_r $RANK \
+    --use_hpu\
     $EXTRA_ARGS \
     $TASK_ARGS \
     "$@"
