@@ -23,6 +23,7 @@ from metrics import calculate_metric
 from utils import *
 from trainer import OurTrainer
 import random
+import wandb
 
 @dataclass
 class OurArguments(TrainingArguments):
@@ -474,6 +475,15 @@ def result_file_tag(args):
 
 def main():
     args = parse_args()
+
+    model_name = args.model_name.split('/')[-1].strip()
+    run_name = f"{model_name}_{args.trainer}"
+    run_name += f"_ft_{args.task_name}_lr_{args.learning_rate:.0e}_bsz_{args.per_device_train_batch_size}_steps_{args.max_steps}"
+    if "LOZO" in args.trainer:
+        run_name += f"_r_{args.rank_r}_nu_{args.step_interval}"
+        
+    wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
+    wandb.init(project="kfac-lozo", name=run_name, config=args)
 
     set_seed(args.seed)
     task = get_task(args.task_name)

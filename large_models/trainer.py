@@ -872,7 +872,7 @@ class OurTrainer(Trainer):
         perturb_parameters_func(scaling_factor=1)
         return loss1
 
-    def zo_update(self, model):
+    def zo_update(self):
         """
         Update the parameters with the estimated gradients.
         """
