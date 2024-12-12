@@ -25,7 +25,10 @@ from trainer import OurTrainer
 import random
 
 ########## Gaudi-specific ###########
-from optimum.habana import GaudiTrainingArguments
+import habana_frameworks.torch.core as htcore
+from optimum.habana import GaudiTrainingArguments, GaudiConfig
+from optimum.habana.transformers.models import GaudiOPTForCausalLM
+
 from trainer_gaudi import OurGaudiTrainer
 #####################################
 
@@ -155,21 +158,24 @@ class Framework:
             free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
             config = AutoConfig.from_pretrained(self.args.model_name if self.args.model_path is None else self.args.model_path)
             
-            
-            
             if self.args.untie_emb:
                 # Untie embeddings/LM head
                 logger.warn("Untie embeddings and LM head")
                 config.tie_word_embeddings = False
             if self.args.head_tuning:
                 # Head tuning
+                raise NotImplementedError("HPU not implemented for head tuning")
+
                 from ht_opt import OPTForCausalLM
                 model = OPTForCausalLM.from_pretrained(
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
                 )
+                
             elif self.args.no_auto_device:
                 # No auto device (use for FSDP)
+                raise NotImplementedError("HPU not implemented for no-auto-device")
+
                 model = AutoModelForCausalLM.from_pretrained(
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
@@ -181,14 +187,18 @@ class Framework:
                     torch_dtype = torch.float16
                 elif self.args.load_bfloat16:
                     torch_dtype = torch.bfloat16
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.args.model_name if self.args.model_path is None else self.args.model_path,
-                    config=config,
-                    device_map='auto',
-                    torch_dtype=torch_dtype,
-                    max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
-                    load_in_8bit=self.args.load_int8,
-                )
+                
+                if "opt" in args.model_name:
+                    model = GaudiOPTForCausalLM.from_pretrained(
+                        self.args.model_name if self.args.model_path is None else self.args.model_path,
+                        config=config,
+                        device_map='cpu',
+                        torch_dtype=torch_dtype,
+                    )
+                else:
+                    raise NotImplementedError(f"HPU not implemented for this model, {args.model_name}")
+            
+            model.to(torch.device("hpu"))
             model.eval()
 
         # Load tokenizer
@@ -426,6 +436,7 @@ class Framework:
         else:
             collator = DataCollatorForTokenClassification
 
+        gaudi_config = GaudiConfig.from_pretrained('habana/llama')
         if "LOZO" in self.args.trainer or "MeZO" in self.args.trainer:
             trainer = OurTrainer(
                 model=self.model, 
@@ -434,6 +445,7 @@ class Framework:
                 eval_dataset=eval_dataset,
                 tokenizer=self.tokenizer,
                 data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
+                gaudi_config=gaudi_config,
             )
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())

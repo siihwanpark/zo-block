@@ -24,8 +24,6 @@ from utils import *
 from trainer import OurTrainer
 import random
 
-import habana_frameworks.torch.core as htcore
-
 @dataclass
 class OurArguments(TrainingArguments):
     # dataset and sampling strategy
@@ -117,9 +115,6 @@ class OurArguments(TrainingArguments):
     weight_decay: float = 0.0
     momentum: float = 0.9
 
-    # Gaudi-specific arguments
-    use_hpu: bool = False
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser = HfArgumentParser(OurArguments)
@@ -147,6 +142,7 @@ class Framework:
             assert self.args.load_bfloat16, "Adam is only supported for bfloat16 training"
         
         with count_time("Loading model with %s" % ("FP16" if self.args.load_float16 else "BF16" if self.args.load_bfloat16 else "FP32")):
+            free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
             config = AutoConfig.from_pretrained(self.args.model_name if self.args.model_path is None else self.args.model_path)
             if self.args.untie_emb:
                 # Untie embeddings/LM head
@@ -173,18 +169,12 @@ class Framework:
                 elif self.args.load_bfloat16:
                     torch_dtype = torch.bfloat16
 
-                if self.args.use_hpu:
-                    max_memory={0: '90GB'}
-                else:
-                    free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
-                    max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())}
-
                 model = AutoModelForCausalLM.from_pretrained(
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
-                    # device_map='auto',
+                    device_map='auto',
                     torch_dtype=torch_dtype,
-                    # max_memory=max_memory,
+                    max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
                     load_in_8bit=self.args.load_int8,
                 )
             model.eval()
