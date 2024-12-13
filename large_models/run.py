@@ -245,7 +245,6 @@ class Framework:
             # Only return the option (candidate) part
             return selected_log_probs[-option_len:]
 
-
     def one_step_pred(self, train_samples, eval_sample, verbose=False):
         """
         Return the prediction on the eval sample. In ICL, use train_samples as demonstrations
@@ -255,7 +254,6 @@ class Framework:
             logger.info("========= Example =========")
             logger.info(f"Candidate: {eval_sample.candidates}")
             logger.info(f"Correct candidate: {eval_sample.correct_candidate}")
-
 
         # Encode (add prompt and tokenize) the sample; if multiple-choice/classification, encode all candidates (options)
         encoded_candidates, option_lens = encode_prompt(

@@ -105,6 +105,7 @@ for LR in "${LR_LIST[@]}"; do
         --train_as_classification \
         --step_interval $STEP_INTERVAL \
         --rank_r $RANK \
+        --max_grad_norm 0.0\
         $EXTRA_ARGS \
         $TASK_ARGS
         # $@"
