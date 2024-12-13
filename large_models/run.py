@@ -531,6 +531,10 @@ def main():
                 print(metrics)
                 if args.local_rank <= 0:
                     write_metrics_to_file(metrics, "result/" +  result_file_tag(args) + f"-trainset{train_set_id}.json" if args.result_file is None else args.result_file)
+                    try:
+                        wandb.log(metrics)
+                    except:
+                        exit(0)
 
     else:
         # For each eval sample, there is a training set. no training is allowed

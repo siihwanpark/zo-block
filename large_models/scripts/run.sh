@@ -3,12 +3,13 @@
 # export PT_HPU_LAZY_MODE=0
 # export PT_HPU_GPU_MIGRATION=1
 device=$1
+export CUDA_VISIBLE_DEVICES=$device
+
 trainer=$2
 rank=$3
-
 shift 3
 
-export CUDA_VISIBLE_DEVICES=$device
+LR_LIST=("$@")
 
 # Default values
 MODEL="facebook/opt-1.3b"
@@ -18,9 +19,9 @@ TRAIN=1000
 DEV=500
 EVAL=1000
 STEPS=20000
-EVAL_STEPS=4000
+EVAL_STEPS=1000
 MODE="ft"
-TASK="RTE"
+TASK="SST2"
 SEED=0
 RANK=$rank
 STEP_INTERVAL=50
@@ -54,15 +55,15 @@ case $TASK in
         ;;
 esac
 
-if [ "$Trainer" == "MeZO-SGD" ] || [ "$Trainer" == "MeZO-Adam" ]; then
-    LR_LIST=(1e-5 1e-6 1e-7)
-elif [ "$Trainer" == "LOZO-SGD" ] || [ "$Trainer" == "LOZO-Adam" ]; then
-    LR_LIST=(1e-5 1e-6 1e-7)
-else
-    LR_LIST=(1e-4 3e-5 1e-5 3e-6 1e-6 3e-7 1e-7)
-fi
+# if [ "$Trainer" == "MeZO-SGD" ] || [ "$Trainer" == "LOZO-SGD" ]; then
+#     LR_LIST=(1e-6 5e-7 2e-7 1e-7)
+# elif [ "$Trainer" == "MeZO-Adam" ] || [ "$Trainer" == "LOZO-Adam" ]; then
+#     LR_LIST=(1e-4 5e-5 2e-5 1e-5)
+# else
+#     LR_LIST=(1e-4 5e-5 2e-5 1e-5 5e-6 2e-6 1e-6)
+# fi
 
-for LR in ${LR_LIST[@]}; do
+for LR in "${LR_LIST[@]}"; do
 
     # Generate tag
     TAG="$Trainer-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$STEP_INTERVAL-$RANK"
@@ -105,6 +106,6 @@ for LR in ${LR_LIST[@]}; do
         --step_interval $STEP_INTERVAL \
         --rank_r $RANK \
         $EXTRA_ARGS \
-        $TASK_ARGS \
-        "$@"
+        $TASK_ARGS
+        # $@"
 done
