@@ -2,8 +2,15 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
 large_models/wandb
 large_models/result
+
+medium_models/wandb
+medium_models/result
+medium_models/log_dir
+medium_models/data/original
+medium_models/data/k-shot-1k-test
 
 # C extensions
 *.so
