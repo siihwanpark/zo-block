@@ -97,17 +97,14 @@ for LR in "${LR_LIST[@]}"; do
         --learning_rate $LR --zo_eps $EPS \
         --per_device_train_batch_size $BS \
         --lr_scheduler_type "constant" \
-        --load_best_model_at_end \
-        --evaluation_strategy steps --save_strategy steps \
-        --save_total_limit 2 \
+        --evaluation_strategy steps --save_strategy no \
         --eval_steps $EVAL_STEPS \
-        --save_steps $SAVE_STEPS \
         --train_as_classification \
         --step_interval $STEP_INTERVAL \
         --rank_r $RANK \
         --max_grad_norm 0.0 \
-        --delete_ckpts_at_end \
         $EXTRA_ARGS \
         $TASK_ARGS
         # $@"
+        # --save_strategy steps --save_total_limit 2 --save_steps $SAVE_STEPS --load_best_model_at_end --delete_ckpts_at_end
 done
