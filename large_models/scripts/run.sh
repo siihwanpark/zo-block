@@ -26,7 +26,7 @@ SEED=0
 RANK=$rank
 STEP_INTERVAL=50
 Trainer=$trainer
-SAVE_STEPS=40000
+SAVE_STEPS=1000
 
 # Additional arguments based on mode
 case $MODE in
@@ -99,13 +99,14 @@ for LR in "${LR_LIST[@]}"; do
         --lr_scheduler_type "constant" \
         --load_best_model_at_end \
         --evaluation_strategy steps --save_strategy steps \
-        --save_total_limit 1 \
+        --save_total_limit 2 \
         --eval_steps $EVAL_STEPS \
         --save_steps $SAVE_STEPS \
         --train_as_classification \
         --step_interval $STEP_INTERVAL \
         --rank_r $RANK \
-        --max_grad_norm 0.0\
+        --max_grad_norm 0.0 \
+        --delete_ckpts_at_end \
         $EXTRA_ARGS \
         $TASK_ARGS
         # $@"

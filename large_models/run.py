@@ -116,6 +116,8 @@ class OurArguments(TrainingArguments):
     weight_decay: float = 0.0
     momentum: float = 0.9
 
+    delete_ckpts_at_end: bool = False # delete checkpoints at the end of training
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser = HfArgumentParser(OurArguments)
@@ -533,6 +535,12 @@ def main():
                         wandb.log(metrics)
                     except:
                         exit(0)
+            
+            if args.delete_ckpts_at_end:
+                # Delete checkpoints at the end
+                for f in os.listdir(args.output_dir):
+                    if f.endswith(".bin") or f.endswith(".safetensors"):
+                        os.remove(os.path.join(args.output_dir, f))
 
     else:
         # For each eval sample, there is a training set. no training is allowed
