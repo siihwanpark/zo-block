@@ -539,7 +539,7 @@ def main():
             if args.delete_ckpts_at_end:
                 # Delete checkpoints at the end
                 for f in os.listdir(args.output_dir):
-                    if f.endswith(".bin") or f.endswith(".safetensors"):
+                    if f.endswith(".bin") or f.endswith(".safetensors") or f.endswith(".pt"):
                         os.remove(os.path.join(args.output_dir, f))
 
     else:
