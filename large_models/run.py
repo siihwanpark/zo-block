@@ -118,6 +118,10 @@ class OurArguments(TrainingArguments):
 
     delete_ckpts_at_end: bool = False # delete checkpoints at the end of training
 
+    num_sampling: int = 1 # number of sampling for zeroth-order gradient estimation
+    std_scaling: bool = False
+    v_t_logging_steps: int = 0
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser = HfArgumentParser(OurArguments)
@@ -414,16 +418,15 @@ class Framework:
             collator = NondiffCollator
         else:
             collator = DataCollatorForTokenClassification
-
-        if "LOZO" in self.args.trainer or "MeZO" in self.args.trainer:
-            trainer = OurTrainer(
+        
+        trainer = OurTrainer(
                 model=self.model, 
                 args=self.args,
                 train_dataset=train_dataset, 
                 eval_dataset=eval_dataset,
                 tokenizer=self.tokenizer,
                 data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
-            )
+        )
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
 
@@ -480,7 +483,9 @@ def main():
     run_name = f"{model_name}_{args.trainer}"
     run_name += f"_ft_{args.task_name}_lr_{args.learning_rate:.0e}_bsz_{args.per_device_train_batch_size}_steps_{args.max_steps}"
     if "LOZO" in args.trainer:
-        run_name += f"_r_{args.rank_r}_nu_{args.step_interval}"
+        run_name += f"_r_{args.rank_r}_nu_{args.step_interval}_q_{args.num_sampling}"
+    elif "MeZO" in args.trainer:
+        run_name += f"_q_{args.num_sampling}"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
     wandb.init(project="kfac-lozo", name=run_name, config=args)
@@ -488,6 +493,10 @@ def main():
     set_seed(args.seed)
     task = get_task(args.task_name)
     train_sets = task.sample_train_sets(num_train=args.num_train, num_dev=args.num_dev, num_eval=args.num_eval, num_train_sets=args.num_train_sets, seed=args.train_set_seed)
+
+    # Scale learning rate for LOZO-SGD or LOZO-Adam according to rank_r
+    if args.trainer == "LOZO-SGD" or args.trainer == "LOZO-Adam":
+        args.learning_rate /= args.rank_r
 
     # Initialize trainer and load model
     framework = Framework(args, task)

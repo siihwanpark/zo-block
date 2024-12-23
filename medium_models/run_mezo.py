@@ -529,6 +529,12 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "Tune the head only"}
     )
 
+    # v_t logging args
+    v_t_logging_steps: int = field(
+        default=100,
+        metadata={"help": "Log v_t every n steps"}
+    )
+
 
 @dataclass
 class MyDataCollatorWithPadding:

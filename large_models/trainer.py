@@ -311,6 +311,56 @@ SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 FSDP_MODEL_NAME = "pytorch_model_fsdp"
 
+# Name of the module used for random perturbation sanity checks
+SANITY_CHECK = False
+SANITY_CHECK_MODULE_NAME = "model.decoder.layers.11.self_attn.k_proj.weight"
+
+# Parameters to log v_t
+PARAMETER_MAP_ZO = [
+    (0, "lm_head"),
+    (4, "layer0.k_proj"),
+    (6, "layer0.v_proj"),
+    (8, "layer0.q_proj"),
+    (10, "layer0.out_proj"),
+    (14, "layer0.fc1"),
+    (16, "layer0.fc2"),
+    (196, "layer12.k_proj"),
+    (198, "layer12.v_proj"),
+    (200, "layer12.q_proj"),
+    (202, "layer12.out_proj"),
+    (206, "layer12.fc1"),
+    (208, "layer12.fc2"),
+    (372, "layer23.k_proj"),
+    (374, "layer23.v_proj"),
+    (376, "layer23.q_proj"),
+    (378, "layer23.out_proj"),
+    (382, "layer23.fc1"),
+    (384, "layer23.fc2"),
+]
+
+PARAMETER_MAP_FO = [
+    (0, "lm_head"),
+    (2, "layer0.k_proj"),
+    (3, "layer0.v_proj"),
+    (4, "layer0.q_proj"),
+    (5, "layer0.out_proj"),
+    (6, "layer0.fc1"),
+    (7, "layer0.fc2"),
+    (74, "layer12.k_proj"),
+    (75, "layer12.v_proj"),
+    (76, "layer12.q_proj"),
+    (77, "layer12.out_proj"),
+    (78, "layer12.fc1"),
+    (79, "layer12.fc2"),
+    (140, "layer23.k_proj"),
+    (141, "layer23.v_proj"),
+    (142, "layer23.q_proj"),
+    (143, "layer23.out_proj"),
+    (144, "layer23.fc1"),
+    (145, "layer23.fc2"),
+]
+
+import pickle, wandb
 
 class OurTrainer(Trainer):
 
@@ -502,7 +552,7 @@ class OurTrainer(Trainer):
         elif "SGD" in args.trainer:
             self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
         else:
-            logging.info(f"args.trainer {args.trainer} is not a ZO trainer. Do not define separated optimizer.")
+            logger.info(f"args.trainer {args.trainer} is not a ZO trainer. Do not define separated optimizer.")
         ############################################
 
         # Check if saved optimizer or scheduler states exist
@@ -680,7 +730,7 @@ class OurTrainer(Trainer):
                         ################# ZO added #################
                         if "LOZO" in args.trainer or "MeZO" in args.trainer:
                             # zo training
-                            tr_loss_step = self.zo_step(model, inputs, lowrank="LOZO" in args.trainer, kfac="KFAC" in args.trainer)
+                            tr_loss_step = self.zo_step(model, inputs, sanity_check=SANITY_CHECK, lowrank="LOZO" in args.trainer, kfac="KFAC" in args.trainer, num_sampling=args.num_sampling)
                         else:
                             # regular training
                             tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
@@ -718,7 +768,7 @@ class OurTrainer(Trainer):
 
                         elif "MeZO" in args.trainer:
                             self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
-                            grad_norm = self.zo_update()
+                            grad_norm = self.zo_update(num_sampling=args.num_sampling, sanity_check=SANITY_CHECK)
                             self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
                         
                         else:
@@ -754,6 +804,7 @@ class OurTrainer(Trainer):
                             self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
 
                             self.optimizer.step()
+                            # import pdb;pdb.set_trace()
 
                             self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
 
@@ -763,6 +814,7 @@ class OurTrainer(Trainer):
                                 if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                                     self.lr_scheduler.step()
 
+                        # import pdb; pdb.set_trace()
                         model.zero_grad()
                         self.state.global_step += 1
                         self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
@@ -770,6 +822,26 @@ class OurTrainer(Trainer):
                         self._maybe_log_save_evaluate(
                             tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time
                         )
+
+                        if self.args.v_t_logging_steps > 0 and self.state.global_step % self.args.v_t_logging_steps == 0:
+                            parameter_map = PARAMETER_MAP_FO if self.args.trainer == "regular" else PARAMETER_MAP_ZO
+                            for param_map in parameter_map:
+                                # m_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg'].clone().detach().cpu()
+                                v_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg_sq'].clone().detach().cpu()
+                                mean_v_t, std_v_t = v_t.mean().item(), v_t.std().item()
+                                wandb.log({f"mean(v_t)/{param_map[1]}": mean_v_t}, step=self.state.global_step)
+                                wandb.log({f"std(v_t)/{param_map[1]}": std_v_t}, step=self.state.global_step)
+                                wandb.log({f"CoV(v_t)/{param_map[1]}": std_v_t/mean_v_t}, step=self.state.global_step)
+                                
+                                # try:
+                                #     with open(os.path.join(self.args.output_dir, f"{param_map[1]}/v_t_steps_{self.state.global_step}.pkl"), mode="wb") as f:
+                                #         pickle.dump(v_t, f)
+                                # except FileNotFoundError:
+                                #     os.makedirs(os.path.join(self.args.output_dir, f"{param_map[1]}"))
+                                # finally:
+                                #     with open(os.path.join(self.args.output_dir, f"{param_map[1]}/v_t_steps_{self.state.global_step}.pkl"), mode="wb") as f:
+                                #         pickle.dump(v_t, f)
+
                     else:
                         self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -871,7 +943,7 @@ class OurTrainer(Trainer):
 
     # =========================================== LOZO Functions ==============================================================
 
-    def zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0):
+    def zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0, sampling_order=0, sanity_check=False):
         """
         Perturb the parameters with random vector z.
         Input: 
@@ -883,18 +955,20 @@ class OurTrainer(Trainer):
         torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
         
         for name, param in self.named_parameters_to_optim:
-            z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            # z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if self.args.std_scaling:
+                std=1/np.sqrt(param.numel())
+            else:
+                std=1.0
+            
+            z = torch.normal(mean=0, std=std, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             param.data = param.data + scaling_factor * z * self.args.zo_eps
 
             # Sanity Check
-            if order == 1:
-                self.sanity_check_pert1[name] = z.clone()
-            elif order == 2:
-                self.sanity_check_pert2[name] = z.clone()
-            elif order == 3:
-                self.sanity_check_pert3[name] = z.clone()
-
-    def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0):
+            if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                self.sanity_check[sampling_order][order][name] = z.clone()
+        
+    def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0, sampling_order=0, sanity_check=False):
         """
         Perturb the parameters with low-rank perturbation.
         """
@@ -914,12 +988,8 @@ class OurTrainer(Trainer):
                 param.data = param.data + scaling_factor * u@v.t() * self.args.zo_eps
 
                 # Sanity Check
-                if order == 1:
-                    self.sanity_check_pert1[name] = u.clone()
-                elif order == 2:
-                    self.sanity_check_pert2[name] = u.clone()
-                elif order == 3:
-                    self.sanity_check_pert3[name] = u.clone()
+                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                    self.sanity_check[sampling_order][order][name] = z.clone()
 
             else:
                 # for bias
@@ -927,7 +997,7 @@ class OurTrainer(Trainer):
                 param.data = param.data + scaling_factor * z * self.args.zo_eps
 
 
-    def kfac_lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0):
+    def kfac_lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0, sampling_order=0, sanity_check=False):
         """
         Perturb the parameters with Kronecker factored low-rank perturbation.
         """
@@ -952,12 +1022,8 @@ class OurTrainer(Trainer):
                 z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
                 
                 # Sanity Check
-                if order == 1:
-                    self.sanity_check_pert1[name] = z.clone()
-                elif order == 2:
-                    self.sanity_check_pert2[name] = z.clone()
-                elif order == 3:
-                    self.sanity_check_pert3[name] = z.clone()
+                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                    self.sanity_check[sampling_order][order][name] = z.clone()
             
                 param.data = param.data + scaling_factor * ((u@(u.t()@z))@v)@v.t() * self.args.zo_eps
 
@@ -1008,7 +1074,7 @@ class OurTrainer(Trainer):
         return -torch.tensor(np.mean(f1s), dtype=torch.float32)
 
 
-    def zo_step(self, model, inputs, lowrank=False, kfac=False, sanity_check=False):
+    def zo_step(self, model, inputs, lowrank=False, kfac=False, sanity_check=False, num_sampling=1):
         """
         Estimate gradient by Lowrank-zo. Return the loss from f(theta + uv^t)
         """
@@ -1020,9 +1086,9 @@ class OurTrainer(Trainer):
             self.v = {}
             self.u = {}
             if sanity_check:
-                self.sanity_check_pert1 = {}
-                self.sanity_check_pert2 = {}
-                self.sanity_check_pert3 = {}
+                self.sanity_check = [[{}, {}, {}] for _ in range(num_sampling)]
+
+        loss = self.zo_forward(model, inputs)
 
         self.named_parameters_to_optim = []
         for name, param in model.named_parameters():
@@ -1036,72 +1102,138 @@ class OurTrainer(Trainer):
         else:
             perturb_parameters_func = self.zo_perturb_parameters
         
+        if num_sampling > 1:
+            assert not (lowrank or kfac), "`num_sampling` is only supported for MeZO"
+            assert self.args.gradient_accumulation_steps == 1
+            
+            self.zo_random_seeds = []
+            self.projected_grads = []
+            
+            for i in range(num_sampling):
+                # Sample the random seed for sampling 
+                self.zo_random_seeds.append(np.random.randint(1000000000))
 
-        # Sample the random seed for sampling 
-        self.zo_random_seed = np.random.randint(1000000000)
+                # First function evaluation
+                perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=0, sampling_order=i, random_seed=self.zo_random_seeds[-1])
+                loss1 = self.zo_forward(model, inputs)
 
-        # First function evaluation
-        perturb_parameters_func(scaling_factor=1, order=1 if sanity_check else 0)
-        loss1 = self.zo_forward(model, inputs)
+                # Second function evaluation
+                perturb_parameters_func(scaling_factor=-2, sanity_check=sanity_check, order=1, sampling_order=i, random_seed=self.zo_random_seeds[-1])
+                loss2 = self.zo_forward(model, inputs)
 
-        # Second function evaluation
-        perturb_parameters_func(scaling_factor=-2, order=2 if sanity_check else 0)
-        loss2 = self.zo_forward(model, inputs)
+                self.projected_grads.append(((loss1 - loss2) / (2 * self.args.zo_eps)).item())
 
-        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+                # Reset model back to its parameters at start of step
+                perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=2, sampling_order=i, random_seed=self.zo_random_seeds[-1])
 
-        # No gradient accumulation support
-        assert self.args.gradient_accumulation_steps == 1
+        else:
+            # Sample the random seed for sampling 
+            self.zo_random_seed = np.random.randint(1000000000)
 
-        # Reset model back to its parameters at start of step
-        perturb_parameters_func(scaling_factor=1, order=3 if sanity_check else 0)
-        return loss1
+            # First function evaluation
+            perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=0)
+            loss1 = self.zo_forward(model, inputs)
 
-    def zo_update(self, sanity_check=False):
+            # Second function evaluation
+            perturb_parameters_func(scaling_factor=-2, sanity_check=sanity_check, order=1)
+            loss2 = self.zo_forward(model, inputs)
+
+            self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+
+            # No gradient accumulation support
+            assert self.args.gradient_accumulation_steps == 1
+
+            # Reset model back to its parameters at start of step
+            perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=2)
+        
+        return loss
+
+    def zo_update(self, sanity_check=False, num_sampling=1):
         """
         Update the parameters with the estimated gradients.
         """
         args = self.args
+        # import pdb; pdb.set_trace()
 
-        # Reset the random seed for sampling zs
-        torch.manual_seed(self.zo_random_seed)
+        if num_sampling > 1:
+            assert num_sampling == len(self.zo_random_seeds) and num_sampling == len(self.projected_grads)
 
-        grad_norm_list = []
-        for name, param in self.named_parameters_to_optim:
-            # Resample z
-            z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            for i in range(num_sampling):
+                torch.manual_seed(self.zo_random_seeds[i])
 
-            # sanity check
-            if sanity_check:
-                pert_pert1 = torch.allclose(z, self.sanity_check_pert1[name], atol=1e-5)
-                pert1_pert2 = torch.allclose(self.sanity_check_pert1[name], self.sanity_check_pert2[name], atol=1e-5)
-                pert2_pert3 = torch.allclose(self.sanity_check_pert2[name], self.sanity_check_pert3[name], atol=1e-5)
-                if not (pert_pert1 and pert1_pert2 and pert2_pert3):
-                    import pdb; pdb.set_trace()
+                for name, param in self.named_parameters_to_optim:
+                    # z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                    if self.args.std_scaling:
+                        std=1/np.sqrt(param.numel())
+                    else:
+                        std=1.0
+                    
+                    z = torch.normal(mean=0, std=std, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
 
-            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-                param.grad = self.projected_grad * z + args.weight_decay * param.data
-            else:
-                param.grad = self.projected_grad * z
+                    # sanity check
+                    if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                        pert_pert1 = torch.allclose(z, self.sanity_check[i][0][name], atol=1e-5)
+                        pert1_pert2 = torch.allclose(self.sanity_check[i][0][name], self.sanity_check[i][1][name], atol=1e-5)
+                        pert2_pert3 = torch.allclose(self.sanity_check[i][1][name], self.sanity_check[i][2][name], atol=1e-5)
+                        if not (pert_pert1 and pert1_pert2 and pert2_pert3):
+                            import pdb; pdb.set_trace()
 
-            # Gradient clipping
-            if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                parameter_ratio = np.sqrt(param.numel() / self.total_trainable_parameters)
-                grad_norm_list.append(self.accelerator.clip_grad_norm_(
-                    param,
-                    args.max_grad_norm * parameter_ratio,
-                ).item())
-                
-            # import pdb;pdb.set_trace()
-            # more mem-efficient:
-            # run optimizer.step here to avoid caching all grad.
+                    if i == 0:
+                        if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                            param.grad = (self.projected_grads[i] * z + args.weight_decay * param.data) / num_sampling
+                        else:
+                            param.grad = (self.projected_grads[i] * z) / num_sampling
+                    else:
+                        if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                            param.grad += (self.projected_grads[i] * z + args.weight_decay * param.data) / num_sampling
+                        else:
+                            param.grad += (self.projected_grads[i] * z) / num_sampling
+            
             self.optimizer.step()
-            param.grad = None
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
 
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
-        
-        return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
+            return 0
+        else:
+            # Reset the random seed for sampling zs
+            torch.manual_seed(self.zo_random_seed)
+
+            grad_norm_list = []
+            for name, param in self.named_parameters_to_optim:
+                # Resample z
+                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
+
+                # sanity check
+                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                    pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
+                    pert1_pert2 = torch.allclose(self.sanity_check[0][0][name], self.sanity_check[0][1][name], atol=1e-5)
+                    pert2_pert3 = torch.allclose(self.sanity_check[0][1][name], self.sanity_check[0][2][name], atol=1e-5)
+                    if not (pert_pert1 and pert1_pert2 and pert2_pert3):
+                        import pdb; pdb.set_trace()
+
+                if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                    param.grad = self.projected_grad * z + args.weight_decay * param.data
+                else:
+                    param.grad = self.projected_grad * z
+
+                # Gradient clipping
+                if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                    parameter_ratio = np.sqrt(param.numel() / self.total_trainable_parameters)
+                    grad_norm_list.append(self.accelerator.clip_grad_norm_(
+                        param,
+                        args.max_grad_norm * parameter_ratio,
+                    ).item())
+                    
+                # import pdb;pdb.set_trace()
+                # more mem-efficient:
+                # run optimizer.step here to avoid caching all grad.
+                self.optimizer.step()
+                param.grad = None
+
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+            
+            return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
 
     def lowrank_zo_update(self, sanity_check=False):
         args = self.args
@@ -1123,10 +1255,10 @@ class OurTrainer(Trainer):
                 u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
                 
                 # sanity check
-                if sanity_check:
-                    pert_pert1 = torch.allclose(u, self.sanity_check_pert1[name], atol=1e-5)
-                    pert1_pert2 = torch.allclose(self.sanity_check_pert1[name], self.sanity_check_pert2[name], atol=1e-5)
-                    pert2_pert3 = torch.allclose(self.sanity_check_pert2[name], self.sanity_check_pert3[name], atol=1e-5)
+                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                    pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
+                    pert1_pert2 = torch.allclose(self.sanity_check[0][0][name], self.sanity_check[0][1][name], atol=1e-5)
+                    pert2_pert3 = torch.allclose(self.sanity_check[0][1][name], self.sanity_check[0][2][name], atol=1e-5)
                     if not (pert_pert1 and pert1_pert2 and pert2_pert3):
                         import pdb; pdb.set_trace()
                 
@@ -1177,10 +1309,10 @@ class OurTrainer(Trainer):
                 z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
 
                 # sanity check
-                if sanity_check:
-                    pert_pert1 = torch.allclose(z, self.sanity_check_pert1[name], atol=1e-5)
-                    pert1_pert2 = torch.allclose(self.sanity_check_pert1[name], self.sanity_check_pert2[name], atol=1e-5)
-                    pert2_pert3 = torch.allclose(self.sanity_check_pert2[name], self.sanity_check_pert3[name], atol=1e-5)
+                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                    pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
+                    pert1_pert2 = torch.allclose(self.sanity_check[0][0][name], self.sanity_check[0][1][name], atol=1e-5)
+                    pert2_pert3 = torch.allclose(self.sanity_check[0][1][name], self.sanity_check[0][2][name], atol=1e-5)
                     if not (pert_pert1 and pert1_pert2 and pert2_pert3):
                         import pdb; pdb.set_trace()
                 
