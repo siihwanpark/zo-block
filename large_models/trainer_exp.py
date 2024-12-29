@@ -1045,35 +1045,42 @@ class OurTrainer(Trainer):
             elif args.p_inv_scaled_perturbation:
                 z = z / (param.data.norm()+ 1e-8)
             
-            if args.rht_perturbation:
+            if param.data.ndim>=2 and args.rht_perturbation:
                 m, n = param.data.shape
                 hadamard = self.exists_hadamard(m) and self.exists_hadamard(n)
-                if self.state.global_step % args.rht_step_interval == 0:
-                    if hadamard:
-                        # Randomized Hadamard Transform
+                if hadamard:
+                    if self.state.global_step % args.rht_step_interval == 0:
                         s_u = (torch.randn(n, device=z.device).sign() + 1e-5).sign().to(z.dtype)
                         s_v = (torch.randn(m, device=z.device).sign() + 1e-5).sign().to(z.dtype)
+                        self.s_u[name] = s_u
+                        self.s_v[name] = s_v
                     else:
-                        # Randomized Kronecker Transform
-                        s_u = rand_ortho_butterfly_noblock(n).to(z.dtype).to(z.device)
-                        s_v = rand_ortho_butterfly_noblock(m).to(z.dtype).to(z.device)
+                        s_u = self.s_u[name]
+                        s_v = self.s_v[name]
 
-                    self.s_u[name] = s_u
-                    self.s_v[name] = s_v
-                else:
-                    s_u = self.s_u[name]
-                    s_v = self.s_v[name]
-
-                if args.reverse_rht:
-                    if hadamard:
+                    if args.reverse_rht:
+                        print(f"{name}: Reverse Randomized Hadamard Transform is on operation")
                         z = self.reverse_randomized_hadamard_transform(z, s_u, s_v)
                     else:
-                        z = s_v.t() @ z @ s_u
+                        print(f"{name}: Randomized Hadamard Transform is on operation")
+                        z= self.randomized_hadamard_transform(z, s_u, s_v)
+                    
                 else:
-                    if hadamard:
-                        z = self.randomized_hadamard_transform(z, s_u, s_v)
-                    else:
-                        z = s_v @ z @ s_u.t()
+                    # This code block takes too long...
+                    # if self.state.global_step % args.rht_step_interval == 0:
+                    #     s_u = rand_ortho_butterfly_noblock(n).to(z.dtype).to(z.device)
+                    #     s_v = rand_ortho_butterfly_noblock(m).to(z.dtype).to(z.device)
+                    #     self.s_u[name] = s_u
+                    #     self.s_v[name] = s_v
+                    # else:
+                    #     s_u = self.s_u[name]
+                    #     s_v = self.s_v[name]
+
+                    # if args.reverse_rht:
+                    #     z = s_v.t() @ z @ s_u
+                    # else:
+                    #     z = s_v @ z @ s_u.t()
+                    pass
             
             if args.sparse_perturbation:
                 grad_sparsity = self.get_grad_sparsity_by_name(name)
@@ -1200,34 +1207,36 @@ class OurTrainer(Trainer):
             elif args.p_inv_scaled_perturbation:
                 z = z * param.data.norm()
 
-            if args.rht_perturbation:
+            if param.data.ndim>=2 and args.rht_perturbation:
                 m, n = param.data.shape
                 hadamard = self.exists_hadamard(m) and self.exists_hadamard(n)
-                if self.state.global_step % args.rht_step_interval == 0:
-                    if hadamard:
-                        # Randomized Hadamard Transform
+                if hadamard:
+                    s_u = self.s_u[name]
+                    s_v = self.s_v[name]
+                    if self.state.global_step % args.rht_step_interval == 0:
                         s_u_ = (torch.randn(n, device=z.device).sign() + 1e-5).sign().to(z.dtype)
                         s_v_ = (torch.randn(m, device=z.device).sign() + 1e-5).sign().to(z.dtype)
-                    else:
-                        # Randomized Kronecker Transform
-                        s_u_ = rand_ortho_butterfly_noblock(n).to(z.dtype).to(z.device)
-                        s_v_ = rand_ortho_butterfly_noblock(m).to(z.dtype).to(z.device)
-                    
-                    del s_u_, s_v_
-                
-                s_u = self.s_u[name]
-                s_v = self.s_v[name]
-
-                if args.reverse_rht:
-                    if hadamard:
+                        del s_u_, s_v_
+                        
+                    if args.reverse_rht:
                         z = self.reverse_randomized_hadamard_transform(z, s_u, s_v)
                     else:
-                        z = s_v.t() @ z @ s_u
+                        z= self.randomized_hadamard_transform(z, s_u, s_v)
+                    
                 else:
-                    if hadamard:
-                        z = self.randomized_hadamard_transform(z, s_u, s_v)
-                    else:
-                        z = s_v @ z @ s_u.t()
+                    # # This code block takes too long...
+                    # s_u = self.s_u[name]
+                    # s_v = self.s_v[name]
+                    # if self.state.global_step % args.rht_step_interval == 0:
+                    #     s_u_ = rand_ortho_butterfly_noblock(n).to(z.dtype).to(z.device)
+                    #     s_v_ = rand_ortho_butterfly_noblock(m).to(z.dtype).to(z.device)
+                    #     del s_u_, s_v_
+
+                    # if args.reverse_rht:
+                    #     z = s_v.t() @ z @ s_u
+                    # else:
+                    #     z = s_v @ z @ s_u.t()
+                    pass
 
             if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
                 param.grad = self.projected_grad * z + args.weight_decay * param.data
