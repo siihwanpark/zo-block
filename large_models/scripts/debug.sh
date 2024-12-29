@@ -22,4 +22,4 @@ device=$1
 #     --rht_perturbation --reverse_rht --rht_step_interval 1
 
 bash scripts/run.sh $device MeZO-Adam\
-    --mixture_perturbation --mixture_p 0.5
+    --p_scaled_perturbation --learning_rate 5e-05 --eval_steps 5
