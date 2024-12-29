@@ -163,6 +163,10 @@ class OurArguments(TrainingArguments):
     reverse_rht: bool = False # Reverse transformation
     rht_step_interval: int = 1 # interval for update random S_U and S_V
 
+    # 7. mixture random perturbation
+    mixture_perturbation: bool = False # Use mixture random perturbation
+    mixture_p: float = 0.5
+
     # Auxiliary components
     blockwise_preconditioning: bool = False # blockwise preconditioning for v_t (Adam-mini)
 
@@ -555,6 +559,9 @@ def main():
             run_name += f"_rrht_nu{args.rht_step_interval}"
         else:
             run_name += f"_rht_nu{args.rht_step_interval}"
+
+    if args.mixture_perturbation:
+        run_name += f"_mixture_p{args.mixture_p}"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
     wandb.init(project="kfac-lozo-exp", name=run_name, config=args)

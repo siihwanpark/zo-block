@@ -1020,6 +1020,17 @@ class OurTrainer(Trainer):
             return self.gradient_sparsity
         elif isinstance(self.gradient_sparsity, dict):
             return self.gradient_sparsity[name]
+        
+    def get_mixture_random_perturbation(self, w, p=0.5):
+        choice = torch.bernoulli(torch.full(w.shape, p, device=w.device))
+
+        gaussian_z = torch.normal(mean=0, std=1, size=w.size(), device=w.device, dtype=w.dtype)
+
+        sign = torch.randint(0, 2, w.shape, device=w.device).float() * 2 - 1
+        exponential = torch.distributions.Exponential(math.sqrt(2)).sample(w.shape).to(w.device)
+        laplace_z = sign * exponential
+
+        return choice * gaussian_z + (1 - choice) * laplace_z
     
     def zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0, sampling_order=0, sanity_check=False):
         """
@@ -1038,10 +1049,13 @@ class OurTrainer(Trainer):
         
         for name, param in self.named_parameters_to_optim:
             # z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-            z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if args.mixture_perturbation:
+                z = self.get_mixture_random_perturbation(w=param.data, p=args.mixture_p)
+            else:
+                z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
 
             if args.p_scaled_perturbation:
-                z = z * param.data.norm()
+                z = z * param.data
             elif args.p_inv_scaled_perturbation:
                 z = z / (param.data.norm()+ 1e-8)
             
@@ -1191,7 +1205,10 @@ class OurTrainer(Trainer):
         grad_norm_list = []
         for name, param in self.named_parameters_to_optim:
             # Resample z
-            z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if args.mixture_perturbation:
+                z = self.get_mixture_random_perturbation(w=param.data, p=args.mixture_p)
+            else:
+                z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
 
             # sanity check
             if sanity_check and name == SANITY_CHECK_MODULE_NAME:
@@ -1203,7 +1220,7 @@ class OurTrainer(Trainer):
 
             # parameter scale-aware random perturbations
             if args.p_scaled_perturbation:
-                z = z / (param.data.norm() + 1e-8)
+                z = z * param.data
             elif args.p_inv_scaled_perturbation:
                 z = z * param.data.norm()
 
@@ -1221,7 +1238,7 @@ class OurTrainer(Trainer):
                     if args.reverse_rht:
                         z = self.reverse_randomized_hadamard_transform(z, s_u, s_v)
                     else:
-                        z= self.randomized_hadamard_transform(z, s_u, s_v)
+                        z = self.randomized_hadamard_transform(z, s_u, s_v)
                     
                 else:
                     # # This code block takes too long...
@@ -1268,7 +1285,6 @@ class OurTrainer(Trainer):
             
         return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
     
-
     ############## Hessian-informed Random Perturbation Functions ##############
     def efficient_Hessian_perturb_parameters(self, model: nn.Module, random_seed, Hessian_matrix=None, scaling_factor=1):
         torch.manual_seed(random_seed)

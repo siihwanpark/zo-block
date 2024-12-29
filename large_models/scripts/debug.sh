@@ -18,5 +18,8 @@ device=$1
 # bash scripts/run.sh $device MeZO-Adam\
 #     --badam --badam_ordering random --badam_K 100
 
+# bash scripts/run.sh $device MeZO-Adam\
+#     --rht_perturbation --reverse_rht --rht_step_interval 1
+
 bash scripts/run.sh $device MeZO-Adam\
-    --rht_perturbation --reverse_rht --rht_step_interval 1
+    --mixture_perturbation --mixture_p 0.5
