@@ -6,11 +6,7 @@ device=$1
 export CUDA_VISIBLE_DEVICES=$device
 
 trainer=$2
-num_sampling=$3
-std_scaling=$4
-shift 4
-
-LR_LIST=("$@")
+shift 2
 
 # Default values
 MODEL="facebook/opt-1.3b"
@@ -28,7 +24,6 @@ RANK=2
 STEP_INTERVAL=50
 Trainer=$trainer
 SAVE_STEPS=1000
-NUM_SAMPLING=$num_sampling
 
 # Additional arguments based on mode
 case $MODE in
@@ -64,23 +59,21 @@ esac
 # else
 #     LR_LIST=(1e-4 5e-5 2e-5 1e-5 5e-6 2e-6 1e-6)
 # fi
-
-if [ $std_scaling -eq 1 ]; then
-    STD_SCALE_TAGS="--std_scaling"
-else
-    STD_SCALE_TAGS=""
-fi
-
+LR_LIST=(1e-5)
 BS_LIST=(16)
 
 for BS in ${BS_LIST[@]}; do
     for LR in "${LR_LIST[@]}"; do
         # Generate tag
-        TAG="$Trainer-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$STEP_INTERVAL-$RANK-$NUM_SAMPLING"
+        TAG="$Trainer-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$STEP_INTERVAL-$RANK"
 
         # Print configuration
         echo "================= Configuration ================="
         echo "Model:           $MODEL"
+        echo "Trainer:         $Trainer"
+        echo "Steps:           $STEPS"
+        echo "Eval steps:      $EVAL_STEPS"
+        echo "Mode:            $MODE"
         echo "Task:            $TASK"
         echo "Batch size:      $BS"
         echo "Learning rate:   $LR"
@@ -111,15 +104,13 @@ for BS in ${BS_LIST[@]}; do
             --evaluation_strategy steps --save_strategy no \
             --eval_steps $EVAL_STEPS \
             --train_as_classification \
-            --step_interval $STEP_INTERVAL \
+            --lowrank_step_interval $STEP_INTERVAL \
             --rank_r $RANK \
             --max_grad_norm 0.0 \
-            --num_sampling $NUM_SAMPLING \
             --v_t_logging_steps 10\
             $EXTRA_ARGS \
             $TASK_ARGS \
-            $STD_SCALE_TAGS
-            # $@"
+            $@
             # --save_strategy steps --save_total_limit 2 --save_steps $SAVE_STEPS --load_best_model_at_end --delete_ckpts_at_end
     done
 done

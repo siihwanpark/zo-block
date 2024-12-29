@@ -182,6 +182,17 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.quantization_config import QuantizationMethod
 
+from pruning_utils import (
+    fast_random_mask_like,
+    estimate_pretrained_model_magnitude_pruning_threshold,
+    compute_named_parameters_to_sparsity,
+)
+
+from lr_scheduler import zo_lr_scheduler
+from Hessian_smooth_scheduler import Hessian_smooth_scheduler
+from matmul_had import matmul_hadU, matmul_hadUt, is_pow2
+from matmul_kron import rand_ortho_butterfly_noblock
+
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -252,7 +263,6 @@ if is_accelerate_available():
 
 if is_accelerate_available("0.28.0"):
     from accelerate.utils import DataLoaderConfiguration
-
 
 def _is_peft_model(model):
     if is_peft_available():
@@ -358,6 +368,15 @@ PARAMETER_MAP_FO = [
     (143, "layer23.out_proj"),
     (144, "layer23.fc1"),
     (145, "layer23.fc2"),
+]
+
+PARAMETER_MAP_BCD = [
+    (0, "k_proj"),
+    (2, "v_proj"),
+    (4, "q_proj"),
+    (6, "out_proj"),
+    (10, "fc1"),
+    (12, "fc2")
 ]
 
 import pickle, wandb
@@ -549,6 +568,8 @@ class OurTrainer(Trainer):
         ################# ZO added #################
         if "Adam" in args.trainer:
             self.optimizer = AdamW(self.model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.adaptivity, weight_decay=args.weight_decay)
+            if args.badam:
+                self.init_block_coordinate_descent(model=self.model, base_optimizer=self.optimizer, block_ordering=args.badam_ordering, include_embedding=args.include_embedding, include_lm_head=args.include_lm_head)
         elif "SGD" in args.trainer:
             self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
         else:
@@ -636,6 +657,26 @@ class OurTrainer(Trainer):
         grad_norm: Optional[float] = None
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
+        ################## ZO added ###################
+        if args.h_informed_perturbation:
+            self.Hessian_matrix = {}
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    self.Hessian_matrix[name] = torch.ones(size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+        
+        if args.sparse_perturbation:
+            self.sparse_grad_rng = torch.Generator(device='cuda' if torch.cuda.is_available() else 'cpu')
+            self.gradient_sparsity = None  # None, float, or dict
+            
+            if args.sparse_gradient_group == "layer" or args.gradient_sparsity is None:
+                self.gradient_sparsity = args.gradient_sparsity
+                print(f"### layer-wise gradient sparsity = {self.gradient_sparsity}")
+            elif args.sparse_gradient_group == "global":
+                threshold = estimate_pretrained_model_magnitude_pruning_threshold(model, args.gradient_sparsity)
+                self.gradient_sparsity = compute_named_parameters_to_sparsity(model, threshold)
+                print(f"### global gradient sparsity, weight magnitude threshold = {threshold}")
+        ###############################################
+
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
 
@@ -668,12 +709,17 @@ class OurTrainer(Trainer):
 
             step = -1
             epoch_iterator = iter(epoch_dataloader)
+            
             # We chunkify the epoch iterator into gradient accumulation steps `n` batches
             remainder = num_examples % args.gradient_accumulation_steps
             if remainder == 0:
                 remainder = args.gradient_accumulation_steps
             update_step = -1
             total_updates = steps_in_epoch // args.gradient_accumulation_steps + 1
+
+            zo_learning_rate = zo_lr_scheduler(self.args.learning_rate, self.args.zo_lr_scheduler_type, self.args.warmup_step, self.args.decay_step, self.state.global_step, int(num_train_epochs))
+            Hessian_smooth = Hessian_smooth_scheduler(self.args.hessian_smooth_type, self.state.global_step, int(num_train_epochs))
+
             for _ in range(total_updates):
                 update_step += 1
                 num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
@@ -719,6 +765,16 @@ class OurTrainer(Trainer):
 
                     if step % args.gradient_accumulation_steps == 0:
                         self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+                    
+                    ################# ZO added #################
+                    # resample sparse_grad_random_seed
+                    if args.sparse_perturbation and (self.state.global_step % args.sparse_gradient_resample_steps == 0):
+                        self.sparse_grad_random_seed = np.random.randint(1000000000)
+
+                    # update active block for block coordinate descent
+                    if args.badam and (self.state.global_step % args.badam_K == 0):
+                        self.update_active_blocks(model, block_ordering=args.badam_ordering)
+                    ############################################
 
                     # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
                     context = (
@@ -728,9 +784,14 @@ class OurTrainer(Trainer):
                     )
                     with context():
                         ################# ZO added #################
-                        if "LOZO" in args.trainer or "MeZO" in args.trainer:
-                            # zo training
-                            tr_loss_step = self.zo_step(model, inputs, sanity_check=SANITY_CHECK, lowrank="LOZO" in args.trainer, kfac="KFAC" in args.trainer, num_sampling=args.num_sampling)
+                        if "MeZO" in args.trainer:
+                            if args.h_informed_perturbation:
+                                tr_loss_step = self.zo_Hessian_step_update(model, inputs, zo_learning_rate, Hessian_smooth)
+                            elif args.lozo_perturbation or args.subzero_perturbation or args.kfac_perturbation:
+                                tr_loss_step = self.lowrank_zo_step(model, inputs, sanity_check=SANITY_CHECK)
+                            else:
+                                # zo training
+                                tr_loss_step = self.zo_step(model, inputs, sanity_check=SANITY_CHECK)
                         else:
                             # regular training
                             tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
@@ -756,19 +817,15 @@ class OurTrainer(Trainer):
                         # Since we perform prefetching, we need to manually set sync_gradients to True
                         self.accelerator.gradient_state._set_sync_gradients(True)
 
-                        if "KFAC" in args.trainer:
+                        if "MeZO" in args.trainer:
                             self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
-                            grad_norm = self.kfac_lowrank_zo_update()
-                            self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
-
-                        elif "LOZO" in args.trainer:
-                            self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
-                            grad_norm = self.lowrank_zo_update()
-                            self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
-
-                        elif "MeZO" in args.trainer:
-                            self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
-                            grad_norm = self.zo_update(num_sampling=args.num_sampling, sanity_check=SANITY_CHECK)
+                            if self.args.h_informed_perturbation:
+                                # update is already done above
+                                grad_norm = 0.0
+                            elif self.args.lozo_perturbation or self.args.subzero_perturbation or self.args.kfac_perturbation:
+                                grad_norm = self.lowrank_zo_update(sanity_check=SANITY_CHECK)
+                            else:
+                                grad_norm = self.zo_update(sanity_check=SANITY_CHECK)
                             self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
                         
                         else:
@@ -823,15 +880,29 @@ class OurTrainer(Trainer):
                             tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time
                         )
 
-                        if self.args.v_t_logging_steps > 0 and self.state.global_step % self.args.v_t_logging_steps == 0:
-                            parameter_map = PARAMETER_MAP_FO if self.args.trainer == "regular" else PARAMETER_MAP_ZO
+                        if args.v_t_logging_steps > 0 and self.state.global_step % args.v_t_logging_steps == 0:
+                            if args.trainer == "regular":
+                                parameter_map = PARAMETER_MAP_FO
+                            elif args.badam:
+                                parameter_map = PARAMETER_MAP_BCD
+                            else:
+                                parameter_map = PARAMETER_MAP_ZO
+                            
                             for param_map in parameter_map:
                                 # m_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg'].clone().detach().cpu()
                                 v_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg_sq'].clone().detach().cpu()
                                 mean_v_t, std_v_t = v_t.mean().item(), v_t.std().item()
-                                wandb.log({f"mean(v_t)/{param_map[1]}": mean_v_t})
-                                wandb.log({f"std(v_t)/{param_map[1]}": std_v_t})
-                                wandb.log({f"CoV(v_t)/{param_map[1]}": std_v_t/mean_v_t})
+
+                                if args.badam:
+                                    assert len(self.active_param_prefixs) == 1, "For now, only one active parameter prefix is supported."
+                                    param_name = ''.join(self.active_param_prefixs[0].split('.')[-3:])
+                                    param_name = f"{param_name}.{param_map[1]}"
+                                else:
+                                    param_name = param_map[1]
+                                
+                                wandb.log({f"mean(v_t)/{param_name}": mean_v_t})
+                                wandb.log({f"std(v_t)/{param_name}": std_v_t})
+                                wandb.log({f"CoV(v_t)/{param_name}": std_v_t/mean_v_t})
                                 
                                 # try:
                                 #     with open(os.path.join(self.args.output_dir, f"{param_map[1]}/v_t_steps_{self.state.global_step}.pkl"), mode="wb") as f:
@@ -941,8 +1012,15 @@ class OurTrainer(Trainer):
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
 
-    # =========================================== LOZO Functions ==============================================================
-
+    # =========================================== MeZO Functions ==============================================================
+    def get_grad_sparsity_by_name(self, name):
+        if self.gradient_sparsity is None:
+            return None
+        elif isinstance(self.gradient_sparsity, float):
+            return self.gradient_sparsity
+        elif isinstance(self.gradient_sparsity, dict):
+            return self.gradient_sparsity[name]
+    
     def zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0, sampling_order=0, sanity_check=False):
         """
         Perturb the parameters with random vector z.
@@ -950,87 +1028,63 @@ class OurTrainer(Trainer):
         - random_seed: random seed for MeZO in-place perturbation (if it's None, we will use self.zo_random_seed)
         - scaling_factor: theta = theta + scaling_factor * z * eps
         """
+        args = self.args
 
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+
+        if args.sparse_perturbation:
+            self.sparse_grad_rng.manual_seed(self.sparse_grad_random_seed)
         
         for name, param in self.named_parameters_to_optim:
             # z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-            if self.args.std_scaling:
-                std=1/np.sqrt(param.numel())
-            else:
-                std=1.0
+            z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+
+            if args.p_scaled_perturbation:
+                z = z * param.data.norm()
+            elif args.p_inv_scaled_perturbation:
+                z = z / (param.data.norm()+ 1e-8)
             
-            z = torch.normal(mean=0, std=std, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if args.rht_perturbation:
+                m, n = param.data.shape
+                hadamard = self.exists_hadamard(m) and self.exists_hadamard(n)
+                if self.state.global_step % args.rht_step_interval == 0:
+                    if hadamard:
+                        # Randomized Hadamard Transform
+                        s_u = (torch.randn(n, device=z.device).sign() + 1e-5).sign().to(z.dtype)
+                        s_v = (torch.randn(m, device=z.device).sign() + 1e-5).sign().to(z.dtype)
+                    else:
+                        # Randomized Kronecker Transform
+                        s_u = rand_ortho_butterfly_noblock(n).to(z.dtype).to(z.device)
+                        s_v = rand_ortho_butterfly_noblock(m).to(z.dtype).to(z.device)
+
+                    self.s_u[name] = s_u
+                    self.s_v[name] = s_v
+                else:
+                    s_u = self.s_u[name]
+                    s_v = self.s_v[name]
+
+                if args.reverse_rht:
+                    if hadamard:
+                        z = self.reverse_randomized_hadamard_transform(z, s_u, s_v)
+                    else:
+                        z = s_v.t() @ z @ s_u
+                else:
+                    if hadamard:
+                        z = self.randomized_hadamard_transform(z, s_u, s_v)
+                    else:
+                        z = s_v @ z @ s_u.t()
+            
+            if args.sparse_perturbation:
+                grad_sparsity = self.get_grad_sparsity_by_name(name)
+                if grad_sparsity is not None:
+                    z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+
             param.data = param.data + scaling_factor * z * self.args.zo_eps
 
             # Sanity Check
             if sanity_check and name == SANITY_CHECK_MODULE_NAME:
                 self.sanity_check[sampling_order][order][name] = z.clone()
-        
-    def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0, sampling_order=0, sanity_check=False):
-        """
-        Perturb the parameters with low-rank perturbation.
-        """
-        args = self.args
-        step = self.step
-
-        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
-        
-        for name, param in self.named_parameters_to_optim:
-            if param.data.ndim >= 2:
-                if step % args.step_interval == 0:
-                    v = torch.randn(param.data.size(1), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    self.v[name] = v
-                else:
-                    v = self.v[name]
-                u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                param.data = param.data + scaling_factor * u@v.t() * self.args.zo_eps
-
-                # Sanity Check
-                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
-                    self.sanity_check[sampling_order][order][name] = z.clone()
-
-            else:
-                # for bias
-                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.data = param.data + scaling_factor * z * self.args.zo_eps
-
-
-    def kfac_lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0, sampling_order=0, sanity_check=False):
-        """
-        Perturb the parameters with Kronecker factored low-rank perturbation.
-        """
-        args = self.args
-        step = self.step
-
-        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
-        
-        for name, param in self.named_parameters_to_optim:
-            if param.data.ndim >= 2:
-                if step % args.step_interval == 0:
-                    u = torch.randn(param.data.size(0), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    v = torch.randn(param.data.size(1), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    u, v = u / torch.linalg.norm(u, dim=0), v / torch.linalg.norm(v, dim=0)
-                    self.u[name] = u
-                    self.v[name] = v
-
-                else:
-                    u = self.u[name]
-                    v = self.v[name]
-                
-                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                
-                # Sanity Check
-                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
-                    self.sanity_check[sampling_order][order][name] = z.clone()
-            
-                param.data = param.data + scaling_factor * ((u@(u.t()@z))@v)@v.t() * self.args.zo_eps
-
-            else:
-                # for bias
-                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.data = param.data + scaling_factor * z * self.args.zo_eps
 
     def zo_forward(self, model, inputs):
         """
@@ -1049,7 +1103,6 @@ class OurTrainer(Trainer):
                 # Warning: this is copied from the original Huggingface Trainer. Untested.
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
         return loss.detach()
-
 
     def zo_forward_nondiff(self, model, inputs):
         """
@@ -1074,7 +1127,7 @@ class OurTrainer(Trainer):
         return -torch.tensor(np.mean(f1s), dtype=torch.float32)
 
 
-    def zo_step(self, model, inputs, lowrank=False, kfac=False, sanity_check=False, num_sampling=1):
+    def zo_step(self, model, inputs, sanity_check=False):
         """
         Estimate gradient by Lowrank-zo. Return the loss from f(theta + uv^t)
         """
@@ -1083,10 +1136,10 @@ class OurTrainer(Trainer):
             self.step += 1
         else:
             self.step = 0
-            self.v = {}
-            self.u = {}
+            self.s_v = {}
+            self.s_u = {}
             if sanity_check:
-                self.sanity_check = [[{}, {}, {}] for _ in range(num_sampling)]
+                self.sanity_check = [{}, {}, {}]
 
         loss = self.zo_forward(model, inputs)
 
@@ -1095,178 +1148,361 @@ class OurTrainer(Trainer):
             if param.requires_grad:
                 self.named_parameters_to_optim.append((name, param))
 
-        if kfac:
-            perturb_parameters_func = self.kfac_lowrank_zo_perturb_parameters
-        elif lowrank:
-            perturb_parameters_func = self.lowrank_zo_perturb_parameters
-        else:
-            perturb_parameters_func = self.zo_perturb_parameters
+        perturb_parameters_func = self.zo_perturb_parameters
         
-        if num_sampling > 1:
-            assert not (lowrank or kfac), "`num_sampling` is only supported for MeZO"
-            assert self.args.gradient_accumulation_steps == 1
-            
-            self.zo_random_seeds = []
-            self.projected_grads = []
-            
-            for i in range(num_sampling):
-                # Sample the random seed for sampling 
-                self.zo_random_seeds.append(np.random.randint(1000000000))
+        # Sample the random seed for sampling 
+        self.zo_random_seed = np.random.randint(1000000000)
 
-                # First function evaluation
-                perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=0, sampling_order=i, random_seed=self.zo_random_seeds[-1])
-                loss1 = self.zo_forward(model, inputs)
+        # First function evaluation
+        perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=0)
+        loss1 = self.zo_forward(model, inputs)
 
-                # Second function evaluation
-                perturb_parameters_func(scaling_factor=-2, sanity_check=sanity_check, order=1, sampling_order=i, random_seed=self.zo_random_seeds[-1])
-                loss2 = self.zo_forward(model, inputs)
+        # Second function evaluation
+        perturb_parameters_func(scaling_factor=-2, sanity_check=sanity_check, order=1)
+        loss2 = self.zo_forward(model, inputs)
 
-                self.projected_grads.append(((loss1 - loss2) / (2 * self.args.zo_eps)).item())
+        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
 
-                # Reset model back to its parameters at start of step
-                perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=2, sampling_order=i, random_seed=self.zo_random_seeds[-1])
+        # No gradient accumulation support
+        assert args.gradient_accumulation_steps == 1
 
-        else:
-            # Sample the random seed for sampling 
-            self.zo_random_seed = np.random.randint(1000000000)
-
-            # First function evaluation
-            perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=0)
-            loss1 = self.zo_forward(model, inputs)
-
-            # Second function evaluation
-            perturb_parameters_func(scaling_factor=-2, sanity_check=sanity_check, order=1)
-            loss2 = self.zo_forward(model, inputs)
-
-            self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
-
-            # No gradient accumulation support
-            assert self.args.gradient_accumulation_steps == 1
-
-            # Reset model back to its parameters at start of step
-            perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=2)
+        # Reset model back to its parameters at start of step
+        perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=2)
         
         return loss
 
-    def zo_update(self, sanity_check=False, num_sampling=1):
+    def zo_update(self, sanity_check=False):
         """
         Update the parameters with the estimated gradients.
         """
         args = self.args
         # import pdb; pdb.set_trace()
 
-        if num_sampling > 1:
-            assert num_sampling == len(self.zo_random_seeds) and num_sampling == len(self.projected_grads)
+        # Reset the random seed for sampling zs
+        torch.manual_seed(self.zo_random_seed)
 
-            for i in range(num_sampling):
-                torch.manual_seed(self.zo_random_seeds[i])
+        grad_norm_list = []
+        for name, param in self.named_parameters_to_optim:
+            # Resample z
+            z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
 
-                for name, param in self.named_parameters_to_optim:
-                    # z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                    if self.args.std_scaling:
-                        std=1/np.sqrt(param.numel())
+            # sanity check
+            if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
+                pert1_pert2 = torch.allclose(self.sanity_check[0][0][name], self.sanity_check[0][1][name], atol=1e-5)
+                pert2_pert3 = torch.allclose(self.sanity_check[0][1][name], self.sanity_check[0][2][name], atol=1e-5)
+                if not (pert_pert1 and pert1_pert2 and pert2_pert3):
+                    import pdb; pdb.set_trace()
+
+            # parameter scale-aware random perturbations
+            if args.p_scaled_perturbation:
+                z = z / (param.data.norm() + 1e-8)
+            elif args.p_inv_scaled_perturbation:
+                z = z * param.data.norm()
+
+            if args.rht_perturbation:
+                m, n = param.data.shape
+                hadamard = self.exists_hadamard(m) and self.exists_hadamard(n)
+                if self.state.global_step % args.rht_step_interval == 0:
+                    if hadamard:
+                        # Randomized Hadamard Transform
+                        s_u_ = (torch.randn(n, device=z.device).sign() + 1e-5).sign().to(z.dtype)
+                        s_v_ = (torch.randn(m, device=z.device).sign() + 1e-5).sign().to(z.dtype)
                     else:
-                        std=1.0
+                        # Randomized Kronecker Transform
+                        s_u_ = rand_ortho_butterfly_noblock(n).to(z.dtype).to(z.device)
+                        s_v_ = rand_ortho_butterfly_noblock(m).to(z.dtype).to(z.device)
                     
-                    z = torch.normal(mean=0, std=std, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                    del s_u_, s_v_
+                
+                s_u = self.s_u[name]
+                s_v = self.s_v[name]
 
-                    # sanity check
-                    if sanity_check and name == SANITY_CHECK_MODULE_NAME:
-                        pert_pert1 = torch.allclose(z, self.sanity_check[i][0][name], atol=1e-5)
-                        pert1_pert2 = torch.allclose(self.sanity_check[i][0][name], self.sanity_check[i][1][name], atol=1e-5)
-                        pert2_pert3 = torch.allclose(self.sanity_check[i][1][name], self.sanity_check[i][2][name], atol=1e-5)
-                        if not (pert_pert1 and pert1_pert2 and pert2_pert3):
-                            import pdb; pdb.set_trace()
-
-                    if i == 0:
-                        if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-                            param.grad = (self.projected_grads[i] * z + args.weight_decay * param.data) / num_sampling
-                        else:
-                            param.grad = (self.projected_grads[i] * z) / num_sampling
+                if args.reverse_rht:
+                    if hadamard:
+                        z = self.reverse_randomized_hadamard_transform(z, s_u, s_v)
                     else:
-                        if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-                            param.grad += (self.projected_grads[i] * z + args.weight_decay * param.data) / num_sampling
-                        else:
-                            param.grad += (self.projected_grads[i] * z) / num_sampling
-            
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.optimizer.zero_grad()
-
-            return 0
-        else:
-            # Reset the random seed for sampling zs
-            torch.manual_seed(self.zo_random_seed)
-
-            grad_norm_list = []
-            for name, param in self.named_parameters_to_optim:
-                # Resample z
-                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-
-                # sanity check
-                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
-                    pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
-                    pert1_pert2 = torch.allclose(self.sanity_check[0][0][name], self.sanity_check[0][1][name], atol=1e-5)
-                    pert2_pert3 = torch.allclose(self.sanity_check[0][1][name], self.sanity_check[0][2][name], atol=1e-5)
-                    if not (pert_pert1 and pert1_pert2 and pert2_pert3):
-                        import pdb; pdb.set_trace()
-
-                if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-                    param.grad = self.projected_grad * z + args.weight_decay * param.data
+                        z = s_v.t() @ z @ s_u
                 else:
-                    param.grad = self.projected_grad * z
+                    if hadamard:
+                        z = self.randomized_hadamard_transform(z, s_u, s_v)
+                    else:
+                        z = s_v @ z @ s_u.t()
 
-                # Gradient clipping
-                if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                    parameter_ratio = np.sqrt(param.numel() / self.total_trainable_parameters)
-                    grad_norm_list.append(self.accelerator.clip_grad_norm_(
-                        param,
-                        args.max_grad_norm * parameter_ratio,
-                    ).item())
-                    
-                # import pdb;pdb.set_trace()
-                # more mem-efficient:
-                # run optimizer.step here to avoid caching all grad.
+            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                param.grad = self.projected_grad * z + args.weight_decay * param.data
+            else:
+                param.grad = self.projected_grad * z
+
+            # sparse random perturbations
+            if args.sparse_perturbation:
+                grad_sparsity = self.get_grad_sparsity_by_name(name)
+                if grad_sparsity is not None:
+                    param.grad[fast_random_mask_like(param.grad, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+
+            # Gradient clipping
+            if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                parameter_ratio = np.sqrt(param.numel() / self.total_trainable_parameters)
+                grad_norm_list.append(self.accelerator.clip_grad_norm_(
+                    param,
+                    args.max_grad_norm * parameter_ratio,
+                ).item())
+                
+            # import pdb;pdb.set_trace()
+            # more mem-efficient:
+            # run optimizer.step here to avoid caching all grad.
+            self.optimizer.step()
+            param.grad = None
+
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
+            
+        return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
+    
+
+    ############## Hessian-informed Random Perturbation Functions ##############
+    def efficient_Hessian_perturb_parameters(self, model: nn.Module, random_seed, Hessian_matrix=None, scaling_factor=1):
+        torch.manual_seed(random_seed)
+        for name, param in self.named_parameters_to_optim:
+            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            param.data = param.data + scaling_factor * torch.sqrt(Hessian_matrix[name]) * z * self.args.zo_eps
+        return model
+    
+    def zo_Hessian_step_update(self, model, inputs, zo_learning_rate, Hessian_smooth, approx_h=False):
+    
+        self.named_parameters_to_optim = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.named_parameters_to_optim.append((name, param))
+        
+        for g in self.optimizer.param_groups:
+            g['lr'] = zo_learning_rate
+
+        random_seed = np.random.randint(1000000000)
+        with torch.no_grad():
+            if approx_h:
+                raise NotImplementedError("approx_h is not implemented yet.")
+            else:
+                loss_original = self.zo_forward(model, inputs)
+
+            # first function evaluation
+            model = self.efficient_Hessian_perturb_parameters(model, random_seed, self.Hessian_matrix, scaling_factor=1)
+            loss1 = self.zo_forward(model, inputs)
+
+            # second function evaluation
+            model = self.efficient_Hessian_perturb_parameters(model, random_seed, self.Hessian_matrix, scaling_factor=-2)
+            loss2 = self.zo_forward(model, inputs)
+                     
+            model = self.efficient_Hessian_perturb_parameters(model, random_seed, self.Hessian_matrix, scaling_factor=1)
+            
+            torch.manual_seed(random_seed)
+            for name, param in self.named_parameters_to_optim:
+                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+
+                Hessian_temp = (1/self.Hessian_matrix[name] * z * z)
+                Hessian_estimator = (torch.abs(loss1+loss2-2 * loss_original)* Hessian_temp  /(2 * self.args.zo_eps*self.args.zo_eps))
+                
+                self.Hessian_matrix[name] = ((1-Hessian_smooth) * self.Hessian_matrix[name] +  Hessian_smooth * Hessian_estimator)
+
+                param.grad = ((loss1-loss2)/(2 * self.args.zo_eps) * z * torch.sqrt(self.Hessian_matrix[name]))
+                # param.data = param.data - zo_learning_rate * (grad + self.args.weight_decay * param.data)
                 self.optimizer.step()
                 param.grad = None
-
+            
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
+
+            loss_out = self.zo_forward(model, inputs)
+        return loss_out
+
+    ############## Low-rank Random Perturbation Functions ##############
+    def generate_projection_matrices(self, m, n, r, device, dtype, orthogonal=False, col_normalize=False):
+        # Generate random projection matrices
+        U = torch.normal(mean=0, std=1, size=(m, r), device=device, dtype=dtype)
+        V = torch.normal(mean=0, std=1, size=(n, r), device=device, dtype=dtype)
+
+        if orthogonal:
+            # Make orthogonal; QR decomposition for BFloat16 is not supported
+            if dtype == torch.bfloat16:
+                U, V = U.to(torch.float32), V.to(torch.float32)
             
-            return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
+            U, _ = torch.linalg.qr(U)
+            V, _ = torch.linalg.qr(V)
+            
+            if dtype == torch.bfloat16:
+                U, V = U.to(dtype), V.to(dtype)
+
+        if col_normalize:
+            # Make orthonormal
+            U = U / torch.linalg.norm(U, dim=0, keepdim=True)
+            V = V / torch.linalg.norm(V, dim=0, keepdim=True)
+        
+        return U, V
+
+    def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=-1, sanity_check=False):
+        args = self.args
+        step = self.step
+
+        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+
+        for name, param in self.named_parameters_to_optim:
+            if param.data.ndim >= 2:
+                if step % args.lowrank_step_interval == 0:
+                    if args.lozo_perturbation:
+                        v = torch.normal(mean=0, std=1, size=(param.data.size(1), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                        self.v[name] = v
+                    elif args.subzero_perturbation:
+                        u, v = self.generate_projection_matrices(m=param.data.size(0), n=param.data.size(1), r=args.rank_r,
+                                                                  device=param.data.device, dtype=param.data.dtype, orthogonal=True)
+                        self.u[name] = u
+                        self.v[name] = v
+                    elif args.kfac_perturbation:
+                        u, v = self.generate_projection_matrices(m=param.data.size(0), n=param.data.size(1), r=args.rank_r,
+                                                                  device=param.data.device, dtype=param.data.dtype, orthogonal=args.orthonormal_projection,
+                                                                  col_normalize=True)
+                        self.u[name] = u
+                        self.v[name] = v
+                    else:
+                        raise ValueError("Unsupported lowrank perturbation type")
+                else:
+                    if args.lozo_perturbation:
+                        v = self.v[name]
+                    elif args.subzero_perturbation or args.kfac_perturbation:
+                        u = self.u[name]
+                        v = self.v[name]
+                    else:
+                        raise ValueError("Unsupported lowrank perturbation type")
+                
+                if args.lozo_perturbation:
+                    u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                    perturbation = u@v.t()
+                elif args.subzero_perturbation:
+                    z = torch.normal(mean=0, std=1, size=(args.rank_r, args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                    perturbation = u@(z@v.t())
+                elif args.kfac_perturbation:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                    perturbation = ((u@(u.t()@z))@v)@v.t()
+                
+                param.data = param.data + scaling_factor * perturbation * args.zo_eps
+            
+            else:
+                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                param.data = param.data + scaling_factor * z * args.zo_eps
+
+    def lowrank_zo_step(self, model, inputs, sanity_check=False):
+        """
+        Estimate gradient by Lowrank-zo. Return the loss from f(theta + uv^t)
+        """
+        args = self.args
+        assert (args.lozo_perturbation + args.subzero_perturbation + args.kfac_perturbation) == 1 ,"Only one of the low-rank perturbation should be specified"
+        
+        if hasattr(self, 'step'):
+            self.step += 1
+        else:
+            self.step = 0
+            self.v = {}
+            self.u = {}
+            if sanity_check:
+                self.sanity_check = [{}, {}, {}]
+
+        loss = self.zo_forward(model, inputs)
+
+        self.named_parameters_to_optim = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.named_parameters_to_optim.append((name, param))
+
+        perturb_parameters_func = self.lowrank_zo_perturb_parameters
+        
+        # Sample the random seed for sampling 
+        self.zo_random_seed = np.random.randint(1000000000)
+
+        # First function evaluation
+        perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=0)
+        loss1 = self.zo_forward(model, inputs)
+
+        # Second function evaluation
+        perturb_parameters_func(scaling_factor=-2, sanity_check=sanity_check, order=1)
+        loss2 = self.zo_forward(model, inputs)
+
+        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+
+        # No gradient accumulation support
+        assert args.gradient_accumulation_steps == 1
+
+        # Reset model back to its parameters at start of step
+        perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=2)
+        
+        return loss
 
     def lowrank_zo_update(self, sanity_check=False):
+        """
+        Update the parameters with the estimated gradients.
+        """
         args = self.args
         step = self.step
+        # import pdb; pdb.set_trace()
 
-        # Reset the random seed for sampling
-        torch.manual_seed(self.zo_random_seed)     
+        # Reset the random seed for sampling zs
+        torch.manual_seed(self.zo_random_seed)
 
         grad_norm_list = []
         for name, param in self.named_parameters_to_optim:
             if param.data.ndim >= 2:
-                v = self.v[name]
+                if step % args.lowrank_step_interval == 0:
+                    if args.lozo_perturbation:
+                        v = self.v[name]
+                        
+                        # dummy sampling for the reproducibility of u
+                        v_ = torch.normal(mean=0, std=1, size=(param.data.size(1), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                        del v_
+
+                    elif args.subzero_perturbation:
+                        u, v = self.u[name], self.v[name]
+
+                        # dummy sampling for the reproduciblility
+                        u_, v_ = self.generate_projection_matrices(m=param.data.size(0), n=param.data.size(1), r=args.rank_r,
+                                                                  device=param.data.device, dtype=param.data.dtype, orthogonal=True)
+                        del u_, v_
+                    
+                    elif args.kfac_perturbation:
+                        u, v = self.u[name], self.v[name]
+                        u_, v_ = self.generate_projection_matrices(m=param.data.size(0), n=param.data.size(1), r=args.rank_r,
+                                                                  device=param.data.device, dtype=param.data.dtype, orthogonal=True,
+                                                                  col_normalize=True)
+                        del u_, v_
+                    else:
+                        raise ValueError("Unsupported lowrank perturbation type")
                 
-                if step % args.step_interval == 0:
-                    # Dummy sampling for the reproducibility of u
-                    v_ = torch.randn(param.data.size(1), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    del v_
+                else:
+                    if args.lozo_perturbation:
+                        v = self.v[name]
+                    elif args.subzero_perturbation or args.kfac_perturbation:
+                        u = self.u[name]
+                        v = self.v[name]
+                    else:
+                        raise ValueError("Unsupported lowrank perturbation type")
                 
-                u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                
-                # sanity check
-                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
-                    pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
-                    pert1_pert2 = torch.allclose(self.sanity_check[0][0][name], self.sanity_check[0][1][name], atol=1e-5)
-                    pert2_pert3 = torch.allclose(self.sanity_check[0][1][name], self.sanity_check[0][2][name], atol=1e-5)
-                    if not (pert_pert1 and pert1_pert2 and pert2_pert3):
-                        import pdb; pdb.set_trace()
-                
-                param.grad = self.projected_grad * u@v.t()
+                if args.lozo_perturbation:
+                    u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                    perturbation = u@v.t()
+                elif args.subzero_perturbation:
+                    z = torch.normal(mean=0, std=1, size=(args.rank_r, args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                    perturbation = u@(z@v.t())
+                elif args.kfac_perturbation:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                    perturbation = ((u@(u.t()@z))@v)@v.t()
+
+                grad = self.projected_grad * perturbation
+
             else:
-                # Resample z for bias
-                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * z
+                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                grad = self.projected_grad * z
+
+            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                param.grad = grad + args.weight_decay * param.data
+            else:
+                param.grad = grad
 
             # Gradient clipping
             if args.max_grad_norm is not None and args.max_grad_norm > 0:
@@ -1275,81 +1511,135 @@ class OurTrainer(Trainer):
                     param,
                     args.max_grad_norm * parameter_ratio,
                 ).item())
-            
+                
             # import pdb;pdb.set_trace()
             # more mem-efficient:
             # run optimizer.step here to avoid caching all grad.
             self.optimizer.step()
-            param.grad = None # avoid further update.
-        
+            param.grad = None
+
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
-
+            
         return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
 
-    def kfac_lowrank_zo_update(self, sanity_check=False):
-        args = self.args
-        step = self.step
+    ############## Block Coordinate Descent Functions ##############
+    def infer_param_groups(self, model, include_embedding=False, include_lm_head=False):
+        """automatic inference of the parameter groups based on the parameter names.
+        divide groups into:
+            * embedding
+            * transformer layers
+            * lm_head and others
 
-        # Reset the random seed for sampling
-        torch.manual_seed(self.zo_random_seed)     
+        Reference : https://github.com/Ledzy/BAdam/blob/12511504e53face3d2612f5bb4bac3a02afa817e/src/badam/block_optim.py#L143
+        """
 
-        grad_norm_list = []
-        for name, param in self.named_parameters_to_optim:
-            if param.data.ndim >= 2:
-                u = self.u[name]
-                v = self.v[name]
-                
-                if step % args.step_interval == 0:
-                    # Dummy sampling for the reproducibility of the z
-                    u_ = torch.randn(param.data.size(0), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    v_ = torch.randn(param.data.size(1), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    del u_, v_
+        block_prefix_list = []
+        lm_head_and_other_params = []
+        embed_pattern = r'.*embed[^.]*\.'
+        layer_pattern = r'.*layers.[^.]*\.'
 
-                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-
-                # sanity check
-                if sanity_check and name == SANITY_CHECK_MODULE_NAME:
-                    pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
-                    pert1_pert2 = torch.allclose(self.sanity_check[0][0][name], self.sanity_check[0][1][name], atol=1e-5)
-                    pert2_pert3 = torch.allclose(self.sanity_check[0][1][name], self.sanity_check[0][2][name], atol=1e-5)
-                    if not (pert_pert1 and pert1_pert2 and pert2_pert3):
-                        import pdb; pdb.set_trace()
-                
-                param.grad = self.projected_grad * ((u @ (u.t() @ z)) @ v) @ v.t()
+        for name, _ in model.named_parameters():
+            if any(prefix[0] in name for prefix in block_prefix_list):
+                continue
+            
+            if re.findall(layer_pattern, name):
+                block_prefix_list.append(re.findall(layer_pattern, name))
+            elif re.findall(embed_pattern, name) and include_embedding:
+                block_prefix_list.append(re.findall(embed_pattern, name))
             else:
-                # Resample z for bias
-                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * z
-            
-            # Gradient clipping
-            if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                parameter_ratio = np.sqrt(param.numel() / self.total_trainable_parameters)
-                grad_norm_list.append(self.accelerator.clip_grad_norm_(
-                    param,
-                    args.max_grad_norm * parameter_ratio,
-                ).item())
-
-            # import pdb;pdb.set_trace()
-            # more mem-efficient:
-            # run optimizer.step here to avoid caching all grad.
-            self.optimizer.step()
-            param.grad = None # avoid further update.
+                lm_head_and_other_params.append(name)
         
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
+        if include_lm_head:
+            block_prefix_list.append(lm_head_and_other_params)
+        
+        return block_prefix_list
+    
+    def init_block_coordinate_descent(self, model, base_optimizer, block_ordering="random", active_modules=[], include_embedding=False, include_lm_head=False):
+        
+        assert base_optimizer is not None, "base_optimizer should be initialized before init_block_coordinate_descent."
+        self.active_modules = active_modules
+        self.block_prefix_list = self.infer_param_groups(model, include_embedding=include_embedding, include_lm_head=include_lm_head)
+        self.block_num = len(self.block_prefix_list)
 
-        return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
+        if block_ordering == "random":
+            self.block_order = torch.randperm(self.block_num).tolist()
+        
+        self.block_optimizer_defaults = base_optimizer.defaults
 
-    def random_gaussian_matrix(self, m, n, device, dtype, random_seed=None):
-        if random_seed is not None:
-            torch.manual_seed(random_seed)
+    def update_active_blocks(self, model, block_ordering="random"):
+        """
+        Update the active blocks for block coordinate descent and re-initialize the optimizer to flush the optimizer states.
+        """
+        assert hasattr(self, 'block_prefix_list') and hasattr(self, 'block_num'), "Block prefix list should be initialized properly."
+        if block_ordering == "random":
+            if len(self.block_order) == 0:
+                self.block_order = torch.randperm(self.block_num).tolist()
+                logger.info("Next block epoch's order has been updated")
+            self.current_block_idx = self.block_order.pop()
+        elif block_ordering == "ascending":
+            if hasattr(self, 'current_block_idx'):
+                self.current_block_idx = (self.current_block_idx + 1) % self.block_num
+            else:
+                self.current_block_idx = 0
+        elif block_ordering == "descending":
+            if hasattr(self, 'current_block_idx'):
+                self.current_block_idx = (self.current_block_idx - 1) % self.block_num
+            else:
+                self.current_block_idx = self.block_num - 1
+        else:
+            raise ValueError(f"{block_ordering} is not a valid block ordering")
 
-        random_matrix = torch.randn(m, n, device=device, dtype=dtype)
-        return random_matrix
+        trainable_param_groups = [
+            {
+                'params': [],
+                'weight_decay': self.optimizer.param_groups[0]['weight_decay'],
+                **self.block_optimizer_defaults
+            },
+            {
+                'params': [],
+                "weight_decay": 0.0,
+                **self.block_optimizer_defaults
+            }
+        ]
 
+        # Set param.requires_grad = False to every inactivated block
+        self.active_param_prefixs = self.block_prefix_list[self.current_block_idx] + self.active_modules
+        for name, param in model.named_parameters():
+            if not any(p in name for p in self.active_param_prefixs):
+                param.requires_grad_(False)
+                param.grad = None
+            else:
+                param.requires_grad_(True)
+                
+                if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                    trainable_param_groups[0]['params'].append(param)
+                else:
+                    trainable_param_groups[1]['params'].append(param)
+
+        # remove the empty param groups
+        trainable_param_groups[:] = [pg for pg in trainable_param_groups if len(pg["params"]) != 0]
+        self.optimizer.param_groups = trainable_param_groups
+
+    ############## Randomized Hadamard Transform Functions ##############
+    def exists_hadamard(self, n):
+        special_numbers = {12, 20, 28, 36, 52, 60, 108, 116, 124, 140, 156, 172}
+        if is_pow2(n):
+            return True
+        
+        for num in special_numbers:
+            if n % num == 0 and is_pow2(n // num):
+                return True
+        
+        return False
+
+    def randomized_hadamard_transform(self, weight, s_u, s_v):
+        return matmul_hadUt(matmul_hadUt(weight.t() * s_v).t() * s_u)
+    
+    def reverse_randomized_hadamard_transform(self, weight, s_u, s_v):
+        return (matmul_hadU((matmul_hadU(weight) * s_u).t()) * s_v).t()
+    
     ############## Misc overload functions ##############
-
 
     def _set_signature_columns_if_needed(self):
         """
@@ -1369,3 +1659,4 @@ class OurTrainer(Trainer):
             # Labels may be named label or label_ids, the default data collator handles that.
             self._signature_columns += list(set(["label", "label_ids"] + self.label_names))
             self._signature_columns += ["gold"]
+

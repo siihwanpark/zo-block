@@ -21,7 +21,8 @@ from torch.utils.data import Dataset
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from metrics import calculate_metric
 from utils import *
-from trainer import OurTrainer
+# from trainer import OurTrainer
+from trainer_exp import OurTrainer
 import random
 import wandb
 
@@ -64,8 +65,8 @@ class OurArguments(TrainingArguments):
 
     # LOZO
     zo_eps: float = 1e-3 # eps in LOZO
-    step_interval: int = 50 # $\nu$ in LOZO
-    rank_r: int = 2 # rank r in LOZO
+    # step_interval: int = 50 # $\nu$ in LOZO
+    # rank_r: int = 2 # rank r in LOZO
 
     # Prefix tuning
     prefix_tuning: bool = False # whether to use prefix tuning
@@ -119,8 +120,51 @@ class OurArguments(TrainingArguments):
     delete_ckpts_at_end: bool = False # delete checkpoints at the end of training
 
     num_sampling: int = 1 # number of sampling for zeroth-order gradient estimation
-    std_scaling: bool = False
     v_t_logging_steps: int = 0
+
+    # Experimental features
+    zo_lr_scheduler_type: str = 'constant'
+    warmup_step: int = 0
+    decay_step: int = 0
+
+    # 1. Parameter scale-aware random perturbation
+    p_scaled_perturbation: bool = False # parameter-scaled random perturbation
+    p_inv_scaled_perturbation: bool = False # inverse parameter-scaled random perturbation
+
+    # 2. Hessian-informed random perturbation
+    h_informed_perturbation: bool = False # HiZOO-like Hessian-informed random perturbation
+    approx_h_informed_perturbation: bool = False # approximated Hessian leverages one-point estimation
+    hessian_smooth_type: str = 'constant1e-6'
+
+    # 3. Sparse random perturbation
+    sparse_perturbation: bool = False # sparse perturbation
+    gradient_sparsity: float = None
+    sparse_gradient_group: str = "layer"
+    sparse_gradient_resample_steps: int = 1
+
+    # 4. Low-rank random perturbation
+    lozo_perturbation: bool = False # LOZO-like low-rank random perturbation
+    subzero_perturbation: bool = False # SubZero-like low-rank random perturbation
+    kfac_perturbation: bool = False # KFAC-LOZO-like low-rank random perturbation
+    orthonormal_projection: bool = False # use of orthonormal projection for low-rank random perturbation
+    lowrank_step_interval: int = 50 # $\nu$ in LOZO
+    rank_r: int = 2 # rank r in LOZO
+
+    # 5. Block-coordinate random perturbation
+    badam: bool = False # Use of BAdam
+    badam_ordering: str = "random" # block ordering for BAdam
+    badam_K: int = 100 # K for BADam
+    include_embedding: bool = False # Include embedding layer for BAdam
+    include_lm_head: bool = False # Include lm_head for BAdam
+    adam_mini_block_partition: bool = False # Adam-mini style block random perturbation
+    
+    # 6. Randomly rotated random perturbation
+    rht_perturbation: bool = False # Randomized Hadamard transform for random perturbation
+    reverse_rht: bool = False # Reverse transformation
+    rht_step_interval: int = 1 # interval for update random S_U and S_V
+
+    # Auxiliary components
+    blockwise_preconditioning: bool = False # blockwise preconditioning for v_t (Adam-mini)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -482,13 +526,38 @@ def main():
     model_name = args.model_name.split('/')[-1].strip()
     run_name = f"{model_name}_{args.trainer}"
     run_name += f"_ft_{args.task_name}_lr_{args.learning_rate:.0e}_bsz_{args.per_device_train_batch_size}_steps_{args.max_steps}"
-    if "LOZO" in args.trainer:
-        run_name += f"_r_{args.rank_r}_nu_{args.step_interval}_q_{args.num_sampling}"
-    elif "MeZO" in args.trainer:
-        run_name += f"_q_{args.num_sampling}"
+    if args.p_scaled_perturbation:
+        run_name += "_p_scaled"
+    if args.p_inv_scaled_perturbation:
+        run_name += "_p_inv_scaled"
+    if args.h_informed_perturbation:
+        run_name += "_h_informed"
+    if args.sparse_perturbation:
+        run_name += f"_sparse_p{args.gradient_sparsity}_group_{args.sparse_gradient_group}_nu_{args.sparse_gradient_resample_steps}"
+    
+    if args.lozo_perturbation:
+        run_name += f"_lozo_r{args.rank_r}_nu{args.lowrank_step_interval}"
+    elif args.subzero_perturbation:
+        run_name += f"_subzero_r{args.rank_r}_nu{args.lowrank_step_interval}"
+    elif args.kfac_perturbation:
+        run_name += f"_kfac_r{args.rank_r}_nu{args.lowrank_step_interval}"
+        if args.orthonormal_projection:
+            run_name += "_orthonormal"
+    
+    if args.badam:
+        run_name += f"_badam_{args.badam_ordering}_K{args.badam_K}"
+
+    if args.max_grad_norm > 0:
+        run_name += f"_max_grad_norm_{args.max_grad_norm}"
+    
+    if args.rht_perturbation:
+        if args.reverse_rht:
+            run_name += f"_rrht_nu{args.rht_step_interval}"
+        else:
+            run_name += f"_rht_nu{args.rht_step_interval}"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
-    wandb.init(project="kfac-lozo", name=run_name, config=args)
+    wandb.init(project="kfac-lozo-exp", name=run_name, config=args)
 
     set_seed(args.seed)
     task = get_task(args.task_name)

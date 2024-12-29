@@ -1,7 +1,7 @@
 device=$1
 
 if [ $device -eq 0 ]; then
-    bash scripts/run.sh $device MeZO-Adam 10 0 2e-05
+    bash scripts/run.sh $device regular 1 0 2e-05
 elif [ $device -eq 1 ]; then
     bash scripts/run.sh $device MeZO-Adam 10 0 2e-05
 elif [ $device -eq 2 ]; then
