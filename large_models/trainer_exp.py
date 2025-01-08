@@ -33,6 +33,7 @@ import tempfile
 import time
 import warnings
 from collections.abc import Mapping
+from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
 from tqdm import tqdm
@@ -197,6 +198,9 @@ from matmul_had import matmul_hadU, matmul_hadUt, is_pow2
 from matmul_kron import rand_ortho_butterfly_noblock
 from utils import encode_prompt, Prediction
 from metrics import calculate_metric
+from adam_mini import Adam_mini
+from lion import Lion
+from cautious_lion import CLion
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -569,13 +573,27 @@ class OurTrainer(Trainer):
 
         ################# ZO added #################
         if "Adam" in args.trainer:
-            self.optimizer = AdamW(self.model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.adaptivity, weight_decay=args.weight_decay)
-            if args.badam:
-                self.init_block_coordinate_descent(model=self.model, base_optimizer=self.optimizer, block_ordering=args.badam_ordering, include_embedding=args.include_embedding, include_lm_head=args.include_lm_head)
+            self.optimizer = AdamW(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.adaptivity, weight_decay=args.weight_decay)
+            if args.sparse_perturbation and args.sparse_update:
+                self.optimizer = AdamWwithSparseUpdate(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.adaptivity, weight_decay=args.weight_decay)
+            if args.adam_mini:
+                self.optimizer = Adam_mini(model.named_parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.adaptivity, weight_decay=args.weight_decay,
+                                            dim=model.config.hidden_size, n_heads=model.config.num_attention_heads, n_kv_heads=model.config.num_attention_heads)
+            if args.adam_mono:
+                self.optimizer = AdamWwithHomogeneousPreconditioning(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.adaptivity, weight_decay=args.weight_decay)
         elif "SGD" in args.trainer:
-            self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
+            self.optimizer = SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
+        elif "Lion" in args.trainer:
+            if args.cautious_optimizer:
+                self.optimizer = CLion(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay, cautious_factor=args.cautious_factor)
+            else:
+                self.optimizer = Lion(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
         else:
             logger.info(f"args.trainer {args.trainer} is not a ZO trainer. Do not define separated optimizer.")
+
+        if args.badam:
+                self.init_block_coordinate_descent(model=model, base_optimizer=self.optimizer, block_ordering=args.badam_ordering,
+                                                    include_embedding=args.include_embedding, include_lm_head=args.include_lm_head, fine_blocks=args.fine_blocks)
         ############################################
 
         # Check if saved optimizer or scheduler states exist
@@ -891,20 +909,38 @@ class OurTrainer(Trainer):
                                 parameter_map = PARAMETER_MAP_ZO
                             
                             for param_map in parameter_map:
-                                # m_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg'].clone().detach().cpu()
-                                v_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg_sq'].clone().detach().cpu()
-                                mean_v_t, std_v_t = v_t.mean().item(), v_t.std().item()
-
                                 if args.badam:
                                     assert len(self.active_param_prefixs) == 1, "For now, only one active parameter prefix is supported."
                                     param_name = ''.join(self.active_param_prefixs[0].split('.')[-3:])
                                     param_name = f"{param_name}.{param_map[1]}"
                                 else:
                                     param_name = param_map[1]
-                                
-                                wandb.log({f"mean(v_t)/{param_name}": mean_v_t})
-                                wandb.log({f"std(v_t)/{param_name}": std_v_t})
-                                wandb.log({f"CoV(v_t)/{param_name}": std_v_t/mean_v_t})
+
+                                if args.adam_mini:
+                                    vmean = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['vmean'].clone().detach().cpu()
+                                    wandb.log({f"vmean/{param_name}": vmean.mean().item()})
+                                elif args.adam_mono:
+                                    vmean = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg_sq'].clone().detach().cpu()
+                                    wandb.log({f"vmean/{param_name}": vmean.mean().item()})
+                                else:
+                                    # m_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg'].clone().detach().cpu()
+                                    v_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg_sq'].clone().detach().cpu()
+                                    mean_v_t, std_v_t = v_t.mean().item(), v_t.std().item()
+
+                                    if args.badam:
+                                        assert len(self.active_param_prefixs) == 1, "For now, only one active parameter prefix is supported."
+                                        param_name = ''.join(self.active_param_prefixs[0].split('.')[-3:])
+                                        param_name = f"{param_name}.{param_map[1]}"
+                                    else:
+                                        param_name = param_map[1]
+                                    
+                                    wandb.log({f"mean(v_t)/{param_name}": mean_v_t})
+                                    wandb.log({f"std(v_t)/{param_name}": std_v_t})
+                                    
+                                    try:    
+                                        wandb.log({f"CoV(v_t)/{param_name}": std_v_t/mean_v_t})
+                                    except ZeroDivisionError:
+                                        wandb.log({f"CoV(v_t)/{param_name}": -1.0})
                                 
                                 # try:
                                 #     with open(os.path.join(self.args.output_dir, f"{param_map[1]}/v_t_steps_{self.state.global_step}.pkl"), mode="wb") as f:
@@ -1125,6 +1161,7 @@ class OurTrainer(Trainer):
             if self.args.n_gpu > 1:
                 # Warning: this is copied from the original Huggingface Trainer. Untested.
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
         return loss.detach()
 
     def zo_forward_nondiff(self, model, inputs):
@@ -1552,7 +1589,7 @@ class OurTrainer(Trainer):
         return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
 
     ############## Block Coordinate Descent Functions ##############
-    def infer_param_groups(self, model, include_embedding=False, include_lm_head=False):
+    def infer_param_groups(self, model, include_embedding=False, include_lm_head=False, fine_blocks=False):
         """automatic inference of the parameter groups based on the parameter names.
         divide groups into:
             * embedding
@@ -1567,27 +1604,79 @@ class OurTrainer(Trainer):
         embed_pattern = r'.*embed[^.]*\.'
         layer_pattern = r'.*layers.[^.]*\.'
 
-        for name, _ in model.named_parameters():
-            if any(prefix[0] in name for prefix in block_prefix_list):
-                continue
+        # Fine-grained patterns for layers
+        query_pattern = r'.*layers.[^.]*\.self_attn\.q_proj'
+        key_pattern = r'.*layers.[^.]*\.self_attn\.k_proj'
+        value_pattern = r'.*layers.[^.]*\.self_attn\.v_proj'
+        out_proj_pattern = r'.*layers.[^.]*\.self_attn\.out_proj'
+        self_attn_layer_norm_pattern = r'.*layers.[^.]*\.self_attn_layer_norm'
+        fc1_pattern = r'.*layers.[^.]*\.fc1'
+        fc2_pattern = r'.*layers.[^.]*\.fc2'
+        final_layer_norm_pattern = r'.*layers.[^.]*\.final_layer_norm'
+
+        if not fine_blocks:
+            for name, _ in model.named_parameters():
+                if any(prefix[0] in name for prefix in block_prefix_list):
+                    continue
+                
+                if re.findall(layer_pattern, name):
+                    block_prefix_list.append(re.findall(layer_pattern, name))
+                elif re.findall(embed_pattern, name) and include_embedding:
+                    block_prefix_list.append(re.findall(embed_pattern, name))
+                else:
+                    lm_head_and_other_params.append(name)
             
-            if re.findall(layer_pattern, name):
-                block_prefix_list.append(re.findall(layer_pattern, name))
-            elif re.findall(embed_pattern, name) and include_embedding:
-                block_prefix_list.append(re.findall(embed_pattern, name))
-            else:
-                lm_head_and_other_params.append(name)
-        
-        if include_lm_head:
-            block_prefix_list.append(lm_head_and_other_params)
+            if include_lm_head:
+                block_prefix_list.append(lm_head_and_other_params)
+        else:
+            # Fine-grained grouping for each layer
+            current_layer = None
+            layer_group = {"qk":[], "vout":[], "norm_fc1":[], "fc2_norm":[]}
+
+            for name, _ in model.named_parameters():
+                # Check embedding parameters
+                if re.findall(embed_pattern, name) and include_embedding:
+                    block_prefix_list.append([name])
+
+                # Layer-wise grouping
+                elif re.match(layer_pattern, name):
+                    layer_idx = int(name.split(".")[3])  # Extract layer index
+
+                    # If a new layer starts, finalize the previous layer's group
+                    if current_layer is not None and layer_idx != current_layer:
+                        block_prefix_list.extend(list(layer_group.values()))
+                        layer_group = {"qk":[], "vout":[], "norm_fc1":[], "fc2_norm":[]}
+
+                    current_layer = layer_idx
+
+                    # Add fine-grained layer parameters
+                    if re.match(query_pattern, name) or re.match(key_pattern, name):
+                        layer_group["qk"].append(name)
+                    elif re.match(value_pattern, name) or re.match(out_proj_pattern, name):
+                        layer_group["vout"].append(name)
+                    elif re.match(self_attn_layer_norm_pattern, name) or re.match(fc1_pattern, name):
+                        layer_group["norm_fc1"].append(name)
+                    elif re.match(fc2_pattern, name) or re.match(final_layer_norm_pattern, name):
+                        layer_group["fc2_norm"].append(name)
+
+                # Check lm_head parameters
+                else:
+                    lm_head_and_other_params.append(name)
+
+            if layer_group:
+                block_prefix_list.extend(list(layer_group.values()))
+
+            # Add lm_head and other parameters at the end
+            if include_lm_head:
+                block_prefix_list.append(lm_head_and_other_params)
         
         return block_prefix_list
     
-    def init_block_coordinate_descent(self, model, base_optimizer, block_ordering="random", active_modules=[], include_embedding=False, include_lm_head=False):
+    def init_block_coordinate_descent(self, model, base_optimizer, block_ordering="random", active_modules=[], include_embedding=False, include_lm_head=False, fine_blocks=False):
         
         assert base_optimizer is not None, "base_optimizer should be initialized before init_block_coordinate_descent."
         self.active_modules = active_modules
-        self.block_prefix_list = self.infer_param_groups(model, include_embedding=include_embedding, include_lm_head=include_lm_head)
+        self.block_prefix_list = self.infer_param_groups(model, include_embedding=include_embedding, include_lm_head=include_lm_head, fine_blocks=fine_blocks)
         self.block_num = len(self.block_prefix_list)
 
         if block_ordering == "random":
@@ -1648,6 +1737,8 @@ class OurTrainer(Trainer):
         # remove the empty param groups
         trainable_param_groups[:] = [pg for pg in trainable_param_groups if len(pg["params"]) != 0]
         self.optimizer.param_groups = trainable_param_groups
+        if self.args.state_flush:
+            self.optimizer.state = defaultdict(dict) # flush the optimizer state
 
     ############## Randomized Hadamard Transform Functions ##############
     def exists_hadamard(self, n):
@@ -1821,3 +1912,152 @@ class OurTrainer(Trainer):
         metrics[f"dev_{metric_name}"]=calculate_metric(predictions, metric_name)
         logger.info(metrics)
         self.log(metrics)
+
+        if hasattr(self, 'best_eval_metrics'):
+            if self.best_eval_metrics[f"best_eval_{metric_name}"] < metrics[f"eval_{metric_name}"]:
+                self.best_eval_metrics[f"best_eval_{metric_name}"] = metrics[f"eval_{metric_name}"]
+            if self.best_eval_metrics[f"best_dev_{metric_name}"] < metrics[f"dev_{metric_name}"]:
+                if self.args.early_stop:
+                    self.patience = 0
+                self.best_eval_metrics[f"best_dev_{metric_name}"] = metrics[f"dev_{metric_name}"]
+            else:
+                if self.args.early_stop:
+                    self.patience += 1
+                    if self.patience >= self.args.patience:
+                        self.control.should_training_stop = True
+        else:
+            if self.args.early_stop:
+                self.patience = 0
+            self.best_eval_metrics = {f"best_eval_{metric_name}": metrics[f"eval_{metric_name}"], f"best_dev_{metric_name}": metrics[f"dev_{metric_name}"]}
+        self.log(self.best_eval_metrics)
+
+class AdamWwithHomogeneousPreconditioning(AdamW):
+
+    @torch.no_grad()
+    def step(self, closure: Callable = None):
+        """
+        Performs a single optimization step.
+
+        Arguments:
+            closure (`Callable`, *optional*): A closure that reevaluates the model and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    # Exponential moving average of gradient values
+                    state["exp_avg"] = torch.zeros_like(p)
+                    # Exponential moving average of squared gradient values
+                    state["exp_avg_sq"] = torch.tensor([0.], device=p.device, dtype=p.dtype)
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = group["betas"]
+
+                state["step"] += 1
+
+                # Decay the first and second moment running average coefficient
+                # In-place operations to update the averages at the same time
+                exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+                exp_avg_sq.mul_(beta2).add_(torch.mean(grad*grad), alpha=1.0 - beta2)
+                denom = exp_avg_sq.sqrt().add_(group["eps"])
+
+                step_size = group["lr"]
+                if group["correct_bias"]:  # No bias correction for Bert
+                    bias_correction1 = 1.0 - beta1 ** state["step"]
+                    bias_correction2 = 1.0 - beta2 ** state["step"]
+                    step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
+
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+
+                # Just adding the square of the weights to the loss function is *not*
+                # the correct way of using L2 regularization/weight decay with Adam,
+                # since that will interact with the m and v parameters in strange ways.
+                #
+                # Instead we want to decay the weights in a manner that doesn't interact
+                # with the m/v parameters. This is equivalent to adding the square
+                # of the weights to the loss with plain (non-momentum) SGD.
+                # Add weight decay at the end (fixed version)
+                if group["weight_decay"] > 0.0:
+                    p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+
+        return loss
+
+class AdamWwithSparseUpdate(AdamW):
+    @torch.no_grad()
+    def step(self, closure: Callable = None):
+        """
+        Performs a single optimization step.
+
+        Arguments:
+            closure (`Callable`, *optional*): A closure that reevaluates the model and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    # Exponential moving average of gradient values
+                    state["exp_avg"] = torch.zeros_like(p)
+                    # Exponential moving average of squared gradient values
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = group["betas"]
+
+                state["step"] += 1
+
+                # Mask for non-zero gradients
+                nonzero_mask = grad > 1e-8
+                nonzero_grad = grad[nonzero_mask]
+
+                # Decay the first and second moment running average coefficient
+                # In-place operations to update the averages at the same time
+                exp_avg[nonzero_mask].mul_(beta1).add_(nonzero_grad, alpha=(1.0 - beta1))
+                exp_avg_sq[nonzero_mask].mul_(beta2).addcmul_(nonzero_grad, nonzero_grad, value=1.0 - beta2)
+                denom = exp_avg_sq.sqrt().add_(group["eps"])
+
+                step_size = group["lr"]
+                if group["correct_bias"]:  # No bias correction for Bert
+                    bias_correction1 = 1.0 - beta1 ** state["step"]
+                    bias_correction2 = 1.0 - beta2 ** state["step"]
+                    step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
+
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+
+                # Just adding the square of the weights to the loss function is *not*
+                # the correct way of using L2 regularization/weight decay with Adam,
+                # since that will interact with the m and v parameters in strange ways.
+                #
+                # Instead we want to decay the weights in a manner that doesn't interact
+                # with the m/v parameters. This is equivalent to adding the square
+                # of the weights to the loss with plain (non-momentum) SGD.
+                # Add weight decay at the end (fixed version)
+                if group["weight_decay"] > 0.0:
+                    p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+
+        return loss

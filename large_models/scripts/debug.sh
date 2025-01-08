@@ -21,5 +21,9 @@ device=$1
 # bash scripts/run.sh $device MeZO-Adam\
 #     --rht_perturbation --reverse_rht --rht_step_interval 1
 
-bash scripts/run.sh $device MeZO-Adam\
-    --p_scaled_perturbation --learning_rate 5e-05 --eval_steps 5
+# bash scripts/run.sh $device MeZO-Adam\
+#     --p_scaled_perturbation --learning_rate 5e-05 --eval_steps 5
+
+bash scripts/run.sh $device MeZO-Lion\
+    --learning_rate 5e-05  --badam --badam_ordering random --badam_K 100 --max_steps 30000 --fine_blocks\
+    --include_embedding --include_lm_head --beta1 0.9 --beta2 0.99

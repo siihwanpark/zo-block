@@ -16,7 +16,7 @@ TRAIN=1000
 DEV=500
 EVAL=1000
 STEPS=10000
-EVAL_STEPS=1000
+EVAL_STEPS=500
 MODE="ft"
 TASK="SST2"
 SEED=0
@@ -107,7 +107,8 @@ for BS in ${BS_LIST[@]}; do
             --lowrank_step_interval $STEP_INTERVAL \
             --rank_r $RANK \
             --max_grad_norm 0.0 \
-            --v_t_logging_steps 10\
+            --v_t_logging_steps 0\
+            --early_stop\
             $EXTRA_ARGS \
             $TASK_ARGS \
             $@

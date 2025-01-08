@@ -141,6 +141,7 @@ class OurArguments(TrainingArguments):
     gradient_sparsity: float = None
     sparse_gradient_group: str = "layer"
     sparse_gradient_resample_steps: int = 1
+    sparse_update: bool = False # sparse update of m_t and v_t
 
     # 4. Low-rank random perturbation
     lozo_perturbation: bool = False # LOZO-like low-rank random perturbation
@@ -154,9 +155,11 @@ class OurArguments(TrainingArguments):
     badam: bool = False # Use of BAdam
     badam_ordering: str = "random" # block ordering for BAdam
     badam_K: int = 100 # K for BADam
+    state_flush: bool = False # flush the optimizer state after one block epoch
     include_embedding: bool = False # Include embedding layer for BAdam
     include_lm_head: bool = False # Include lm_head for BAdam
     adam_mini_block_partition: bool = False # Adam-mini style block random perturbation
+    fine_blocks: bool = False # Finer-grained blocks
     
     # 6. Randomly rotated random perturbation
     rht_perturbation: bool = False # Randomized Hadamard transform for random perturbation
@@ -167,8 +170,21 @@ class OurArguments(TrainingArguments):
     mixture_perturbation: bool = False # Use mixture random perturbation
     mixture_p: float = 0.5
 
+    # 8. Adam-mini
+    adam_mini: bool = False # Use Adam-mini
+    block_adam_mini: bool = False # Use block coordinate descent with Adam-mini style blocking
+
+    # 9. Adam-mono (single v_t for all)
+    adam_mono: bool = False # Use Adam-mono
+
     # Auxiliary components
     blockwise_preconditioning: bool = False # blockwise preconditioning for v_t (Adam-mini)
+    early_stop: bool = False # Use early stopping
+    patience: int = 10
+
+    cautious_optimizer: bool = False # Use cautious
+    cautious_factor: float = 0.0
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -476,11 +492,12 @@ class Framework:
                 data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
         )
         
-        ############### added for evaluating metrics 
+        ############### added for inter-training evaluation ################
         trainer.eval_samples = eval_samples
         trainer.dev_samples = dev_samples
         trainer.task = self.task
-
+        ####################################################################
+        
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
 
@@ -536,6 +553,10 @@ def main():
     model_name = args.model_name.split('/')[-1].strip()
     run_name = f"{model_name}_{args.trainer}"
     run_name += f"_ft_{args.task_name}_lr_{args.learning_rate:.0e}_bsz_{args.per_device_train_batch_size}_steps_{args.max_steps}"
+    if 'SGD' in args.trainer:
+        run_name += f"_m_{args.momentum}"
+    if 'Lion' in args.trainer:
+        run_name += f"_cau_{args.cautious_optimizer}_b1_{args.beta1}_b2_{args.beta2}"
     if args.p_scaled_perturbation:
         run_name += "_p_scaled"
     if args.p_inv_scaled_perturbation:
@@ -544,6 +565,8 @@ def main():
         run_name += "_h_informed"
     if args.sparse_perturbation:
         run_name += f"_sparse_p{args.gradient_sparsity}_group_{args.sparse_gradient_group}_nu_{args.sparse_gradient_resample_steps}"
+        if args.sparse_update:
+            run_name += "_sparse_update"
     
     if args.lozo_perturbation:
         run_name += f"_lozo_r{args.rank_r}_nu{args.lowrank_step_interval}"
@@ -556,6 +579,14 @@ def main():
     
     if args.badam:
         run_name += f"_badam_{args.badam_ordering}_K{args.badam_K}"
+        if args.state_flush:
+            run_name += "_state_flush"
+        if args.include_embedding:
+            run_name += "_embed"
+        if args.include_lm_head:
+            run_name += "_lm_head"
+        if args.fine_blocks:
+            run_name += "_fine_blocks"
 
     if args.max_grad_norm > 0:
         run_name += f"_max_grad_norm_{args.max_grad_norm}"
@@ -568,9 +599,15 @@ def main():
 
     if args.mixture_perturbation:
         run_name += f"_mixture_p{args.mixture_p}"
+
+    if args.adam_mini:
+        run_name += "_adam_mini"
+    
+    if args.adam_mono:
+        run_name += "_adam_mono"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
-    wandb.init(project="kfac-lozo-exp", name=run_name, config=args)
+    wandb.init(project="kfac-lozo-exp4", name=run_name, config=args)
 
     set_seed(args.seed)
     task = get_task(args.task_name)
