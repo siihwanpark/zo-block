@@ -21,9 +21,9 @@ from torch.utils.data import Dataset
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from metrics import calculate_metric
 from utils import *
-from trainer import OurTrainer
 import random
 
+import wandb
 ########## Gaudi-specific ###########
 import habana_frameworks.torch.core as htcore
 from optimum.habana import GaudiTrainingArguments, GaudiConfig
@@ -139,9 +139,9 @@ class OurArguments(GaudiTrainingArguments):
     delete_ckpts_at_end: bool = True
 
     # Gaudi-specific arguments
-    use_habana: bool = field(default=True, metadata={"help": "Whether to use Gaudi HPU for training."})
-    use_lazy_mode: bool = field(default=False, metadata={"help": "Whether to use lazy mode for training."})
-    gaudi_config_name: Optional[str] = field(default="habana/llama", metadata={"help": "name of (Hub) or the path to (local) your Gaudi Configuration file"})
+    use_habana: bool = True
+    use_lazy_mode: bool = False
+    gaudi_config_name: str = "habana/llama"
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -170,7 +170,6 @@ class Framework:
             assert self.args.load_bfloat16, "Adam is only supported for bfloat16 training"
         
         with count_time("Loading model with %s" % ("FP16" if self.args.load_float16 else "BF16" if self.args.load_bfloat16 else "FP32")):
-            free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
             config = AutoConfig.from_pretrained(self.args.model_name if self.args.model_path is None else self.args.model_path)
             
             if self.args.untie_emb:
@@ -185,7 +184,7 @@ class Framework:
             elif self.args.load_bfloat16:
                 torch_dtype = torch.bfloat16
             
-            if "opt" in args.model_name:
+            if "opt" in self.args.model_name:
                 model = GaudiOPTForCausalLM.from_pretrained(
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,

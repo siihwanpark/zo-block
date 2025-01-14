@@ -80,7 +80,7 @@ for BS in ${BS_LIST[@]}; do
         echo "================================================="
 
         # Execute script
-        python run.py \
+        python run_gaudi.py \
             --model_name $MODEL \
             --task_name $TASK \
             --output_dir result/$TASK-${MODEL}-$TAG --tag $TAG \
