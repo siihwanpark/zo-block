@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020-present the HuggingFace Inc. team.
+# Copyright 2022 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,17 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-The Trainer class, to easily train a 🤗 Transformers from scratch or finetune it on a new task.
+The Gaudi Trainer class, to easily train a 🤗 Transformers from scratch or finetune it on a new task.
 """
 
 import contextlib
+import copy
 import functools
-import glob
 import inspect
+import json
 import math
 import os
 import random
-import re
 import shutil
 import sys
 import time
@@ -31,131 +31,83 @@ import warnings
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-import copy
-from metrics import f1
-import numpy as np
 
-from tqdm.auto import tqdm
-from transformers import Trainer
-from sklearn.linear_model import LinearRegression, LogisticRegression, LogisticRegressionCV
-
-# Integrations must be imported before ML frameworks:
-from transformers.integrations import (  # isort: split
-    default_hp_search_backend,
-    get_reporting_integration_callbacks,
-    hp_params,
-    is_fairscale_available,
-    is_optuna_available,
-    is_ray_tune_available,
-    is_sigopt_available,
-    is_wandb_available,
-    run_hp_search_optuna,
-    run_hp_search_ray,
-    run_hp_search_sigopt,
-    run_hp_search_wandb,
-)
-
+import huggingface_hub.utils as hf_hub_utils
 import numpy as np
 import torch
-import torch.distributed as dist
-from packaging import version
-from torch import nn
-from torch.optim import SGD, Adam
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
-from torch.utils.data.distributed import DistributedSampler
-
-from huggingface_hub import Repository
-
-from transformers import __version__
-from transformers.configuration_utils import PretrainedConfig
-from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
-from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
-from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
-from transformers.dependency_versions_check import dep_version_check
-from transformers.modelcard import TrainingSummary
-from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, MODEL_MAPPING_NAMES
-from transformers.optimization import Adafactor, get_scheduler
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_10, is_torch_less_than_1_11
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.trainer_callback import (
-    CallbackHandler,
-    DefaultFlowCallback,
-    PrinterCallback,
-    ProgressCallback,
-    TrainerCallback,
-    TrainerControl,
-    TrainerState,
+from accelerate import skip_first_batches
+from accelerate.data_loader import SeedableRandomSampler
+from accelerate.utils import (
+    DistributedDataParallelKwargs,
+    GradientAccumulationPlugin,
+    load_fsdp_model,
+    load_fsdp_optimizer,
+    save_fsdp_model,
+    save_fsdp_optimizer,
 )
+from huggingface_hub import upload_folder
+from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler
+from transformers import Trainer
+from transformers.data.data_collator import DataCollator
+from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
+from transformers.integrations import hp_params
+from transformers.integrations.deepspeed import (
+    deepspeed_load_checkpoint,
+    is_deepspeed_available,
+    is_deepspeed_zero3_enabled,
+)
+from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.trainer import _get_fsdp_ckpt_kwargs, _is_peft_model
+from transformers.trainer_callback import ExportableState, TrainerCallback, TrainerState
 from transformers.trainer_pt_utils import (
-    DistributedLengthGroupedSampler,
-    DistributedSamplerWithLoop,
     DistributedTensorGatherer,
+    EvalLoopContainer,
     IterableDatasetShard,
-    LabelSmoother,
     LengthGroupedSampler,
     SequentialDistributedSampler,
-    ShardSampler,
-    distributed_broadcast_scalars,
-    distributed_concat,
     find_batch_size,
-    get_module_class_from_name,
-    get_parameter_names,
+    get_model_param_count,
     nested_concat,
     nested_detach,
-    nested_numpify,
-    nested_truncate,
-    nested_xla_mesh_reduce,
     reissue_pt_warnings,
+    remove_dummy_checkpoint,
 )
 from transformers.trainer_utils import (
     PREFIX_CHECKPOINT_DIR,
-    BestRun,
     EvalLoopOutput,
     EvalPrediction,
-    FSDPOption,
     HPSearchBackend,
     HubStrategy,
     IntervalStrategy,
     PredictionOutput,
-    RemoveColumnsCollator,
-    ShardedDDPOption,
-    TrainerMemoryTracker,
     TrainOutput,
-    default_compute_objective,
-    default_hp_space,
     denumpify_detensorize,
     enable_full_determinism,
     find_executable_batch_size,
     get_last_checkpoint,
     has_length,
-    number_of_arguments,
-    seed_worker,
-    # set_seed, # comment-out for the use of optimum.habana.utils.set_seed
-    speed_metrics,
 )
 from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
 from transformers.utils import (
+    ADAPTER_CONFIG_NAME,
+    ADAPTER_SAFE_WEIGHTS_NAME,
+    ADAPTER_WEIGHTS_NAME,
     CONFIG_NAME,
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
     WEIGHTS_INDEX_NAME,
     WEIGHTS_NAME,
-    find_labels,
-    get_full_repo_name,
-    is_apex_available,
+    PushInProgress,
     is_datasets_available,
-    is_in_notebook,
-    is_ipex_available,
-    is_sagemaker_dp_enabled,
-    is_sagemaker_mp_enabled,
-    is_torch_tensorrt_fx_available,
-    is_torch_tpu_available,
-    is_torchdynamo_available,
-    logging,
+    is_peft_available,
+    is_safetensors_available,
 )
-from transformers.utils.generic import ContextManagers
 
-########### Gaudi-Specific ###########
-from optimum.habana import GaudiSeq2SeqTrainer
+from optimum.utils import logging
+
+from optimum.habana.accelerate import GaudiAccelerator
+from optimum.habana.accelerate.utils import FP8ContextWrapper, GaudiDistributedType
 from optimum.habana.utils import (
     HabanaProfile,
     get_hpu_memory_stats,
@@ -163,158 +115,149 @@ from optimum.habana.utils import (
     speed_metrics,
     to_device_dtype,
 )
-#######################################
-
-_is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
-
-DEFAULT_CALLBACKS = [DefaultFlowCallback]
-DEFAULT_PROGRESS_CALLBACK = ProgressCallback
-
-if is_in_notebook():
-    from .utils import NotebookProgressCallback
-
-    DEFAULT_PROGRESS_CALLBACK = NotebookProgressCallback
-
-if is_apex_available():
-    from apex import amp
+from optimum.habana.transformers.gaudi_configuration import GAUDI_CONFIG_NAME, GaudiConfig
+from optimum.habana.transformers.integrations.deepspeed import deepspeed_init
+from optimum.habana.transformers.trainer_utils import convert_into_dtypes, get_dtype
+from optimum.habana.transformers.training_args import GaudiTrainingArguments
 
 if is_datasets_available():
     import datasets
 
-if is_torch_tpu_available(check_device=False):
-    import torch_xla.core.xla_model as xm
-    import torch_xla.debug.metrics as met
-    import torch_xla.distributed.parallel_loader as pl
+if is_safetensors_available():
+    import safetensors.torch
 
-if is_fairscale_available():
-    dep_version_check("fairscale")
-    import fairscale
-    from fairscale.nn.data_parallel import FullyShardedDataParallel as FullyShardedDDP
-    from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
-    from fairscale.nn.wrap import auto_wrap
-    from fairscale.optim import OSS
-    from fairscale.optim.grad_scaler import ShardedGradScaler
+if is_peft_available():
+    from peft import PeftModel
+    from peft.utils import PeftType
 
-if is_sagemaker_mp_enabled():
-    import smdistributed.modelparallel.torch as smp
-    from smdistributed.modelparallel import __version__ as SMP_VERSION
+if is_deepspeed_available():
+    from accelerate.utils import DeepSpeedSchedulerWrapper
 
-    IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
+from accelerate.utils import DataLoaderConfiguration
 
-    from .trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
-else:
-    IS_SAGEMAKER_MP_POST_1_10 = False
+### ZO added ###
+from optimum.habana.transformers import GaudiTrainer
+from torch.optim import AdamW, SGD
 
+from pruning_utils import (
+    fast_random_mask_like,
+    estimate_pretrained_model_magnitude_pruning_threshold,
+    compute_named_parameters_to_sparsity,
+)
+from utils import encode_prompt, Prediction
+from metrics import calculate_metric
+
+################
+
+def _get_input_update_settings(model, lazy_mode: Optional[bool] = None) -> Tuple[bool, Dict]:
+    """
+    Determines whether the input settings need to be updated.
+
+    Currently (attn_softmax_bf16, use_flash_attention, flash_attention_recompute,
+    flash_attention_causal_mask) are enabled only for llama, qwen2, starcoder2, gemma, baichuan
+    and chatglm
+
+    lazy_mode for llama, qwen2, starcoder2 and mistral
+
+    Args:
+        model: The model instance for which the input update settings are being evaluated
+        lazy_mode[Optional[bool]]: Whether to use lazy mode for the model (defaults to `None`)
+
+    Returns:
+        Tuple[bool, Dict]: A flag indicating whether the input settings should be updated.
+        A dictionary containing the specific input settings that need to be updated, if any
+    """
+    inputs_update: Dict = {}
+
+    should_update_inputs = (getattr(model, "generation_config", None) is not None) and (
+        model.config.model_type in ("llama", "qwen2", "starcoder2", "gemma", "baichuan", "chatglm")
+    )
+    if should_update_inputs:
+        if model.generation_config.attn_softmax_bf16:
+            inputs_update["attn_softmax_bf16"] = True
+        if model.generation_config.use_flash_attention:
+            inputs_update["use_flash_attention"] = True
+        if model.generation_config.flash_attention_recompute:
+            inputs_update["flash_attention_recompute"] = True
+        if model.generation_config.flash_attention_causal_mask:
+            inputs_update["flash_attention_causal_mask"] = True
+
+    should_update_inputs = (
+        (getattr(model, "generation_config", None) is not None)
+        and (model.config.model_type in ("llama", "qwen2", "starcoder2", "mistral"))
+        and (lazy_mode is not None)
+    )
+    if should_update_inputs:
+        if _is_peft_model(model):
+            forward_method = getattr(model.get_base_model(), "forward")
+        else:
+            forward_method = getattr(model, "forward")
+        signature = inspect.signature(forward_method)
+        if "lazy_mode" in signature.parameters:
+            inputs_update["lazy_mode"] = lazy_mode
+
+    should_update_inputs: bool = len(inputs_update) > 0
+
+    return should_update_inputs, inputs_update
 
 if TYPE_CHECKING:
     import optuna
 
-logger = logging.get_logger(__name__)
+DATA_SAMPLERS = [RandomSampler, SeedableRandomSampler]
 
+logger = logging.get_logger(__name__)
 
 # Name of the files used for checkpointing
 TRAINING_ARGS_NAME = "training_args.bin"
 TRAINER_STATE_NAME = "trainer_state.json"
 OPTIMIZER_NAME = "optimizer.pt"
+OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
-
 class OurGaudiTrainer(GaudiTrainer):
-    from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
-    
     def _inner_training_loop(
-        self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
+        self,
+        batch_size=None,
+        args=None,
+        resume_from_checkpoint=None,
+        trial=None,
+        ignore_keys_for_eval=None,
     ):
-        """
-        We overload the original training loop to add linear probing and MeZO. Search key word "MeZO added"
-        for those updates.
-        """
+        self.accelerator.free_memory()
         self._train_batch_size = batch_size
+        if self.args.auto_find_batch_size:
+            if self.state.train_batch_size != self._train_batch_size:
+                from accelerate.utils import release_memory
+
+                (self.model_wrapped,) = release_memory(self.model_wrapped)
+                self.model_wrapped = self.model
+
+                # Check for DeepSpeed *after* the initial pass and modify the config
+                if self.is_deepspeed_enabled:
+                    # Temporarily unset `self.args.train_batch_size`
+                    original_bs = self.args.per_device_train_batch_size
+                    self.args.per_device_train_batch_size = self._train_batch_size // max(1, self.args.n_gpu)
+                    self.propagate_args_to_deepspeed(True)
+                    self.args.per_device_train_batch_size = original_bs
+            self.state.train_batch_size = self._train_batch_size
+        logger.debug(f"Currently training with a batch size of: {self._train_batch_size}")
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
-
-        # MeZO added: Linear probing
-        if self.args.linear_probing:
-
-            def _get_token_prediction_layer(model):
-                if model.config.model_type == "opt":
-                    return model.lm_head
-                else:
-                    raise NotImplementedError(model.config.model_type)
-
-            def _extract_features(model, *args, **kwargs):
-                """some magic for getting features pre last layer"""
-                features = {}
-                def __hook(model_, input_, output_):
-                    features["features"] = input_[0].detach()
-
-                _get_token_prediction_layer(model).register_forward_hook(__hook)
-                model.forward(*args, **kwargs)
-                return features["features"]
-
-            logger.info("Linear probing")
-            logger.info("Starting to get features for training dataset")
-            targets = []
-            features = []
-            with torch.inference_mode():
-                for step, inputs in enumerate(tqdm(train_dataloader)):
-                    for k, v in inputs.items():
-                        if isinstance(v, torch.Tensor):
-                            inputs[k] = v.to(self.model.device)
-                        
-                    feature = _extract_features(self.model, **inputs)
-                    target = inputs["labels"]
-
-                    # Shift the target (bc it's autoregressive LM) and add the corresponding part
-                    assert not self.args.train_as_classification and self.args.only_train_option
-                    feature, target = feature[:, :-1], target[:, 1:]
-                    for _i, _len in enumerate(inputs["option_len"]):
-                        features.append(feature[_i, -_len:])
-                        targets.append(target[_i, -_len:])
-
-            logger.info("Finished getting features for training dataset")
-
-            features = torch.cat(features, dim=0).cpu().numpy()
-            targets = torch.cat(targets, dim=0).cpu().numpy()
-            # Whether to use bias
-            if self.model.config.model_type in ["opt", "gpt2"]:
-                use_bias = False
-            else:
-                raise NotImplementedError
-            # Set early stopping
-            tol = 0.01 if self.args.lp_early_stopping else 1e-4 # 1e-4 is scipy default
-            max_iter = 1000 if self.args.lp_early_stopping else 5000
-
-            logger.info("Fitting logistic regression...")
-            reg = LogisticRegressionCV(max_iter=max_iter, fit_intercept=use_bias, multi_class="multinomial", random_state=0, tol=tol, n_jobs=-1).fit(features, targets)
-            logger.info("Done")
-
-            logger.info("Assigning weights to model")
-            decoder = _get_token_prediction_layer(self.model)
-            coef_torch = torch.tensor(reg.coef_, device=decoder.weight.device, dtype=decoder.weight.dtype)
-            if use_bias:
-                bias_torch = torch.tensor(reg.intercept_, device=decoder.weight.device, dtype=decoder.weight.dtype)
-            if coef_torch.shape[0] == 1: # The regressor only detects two classes
-                assert len(reg.classes_) == 2
-                coef_torch = torch.cat([-coef_torch / 2, coef_torch / 2], dim=0)
-                if use_bias:
-                    bias_torch = torch.cat([-bias_torch / 2, bias_torch / 2], dim=0)
-
-            for _i, token_id in enumerate(reg.classes_):
-                decoder.weight.data[token_id] = coef_torch[_i]
-                if use_bias:
-                    decoder.bias.data[token_id] = bias_torch[_i]
-
-            return None
 
         # Setting up training control variables:
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
         # total number of training steps to execute: max_steps
-        total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * args.world_size
+        total_train_batch_size = self._train_batch_size * args.gradient_accumulation_steps * args.world_size
+        if (
+            self.accelerator.mpu.sequence_parallel_is_initialized()
+            and self.accelerator.mpu.get_sequence_parallel_world_size() > 1
+        ):
+            total_train_batch_size = total_train_batch_size / self.accelerator.mpu.get_sequence_parallel_world_size()
 
         len_dataloader = None
+        num_train_tokens = None
         if has_length(train_dataloader):
             len_dataloader = len(train_dataloader)
             num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
@@ -328,10 +271,16 @@ class OurGaudiTrainer(GaudiTrainer):
                 # May be slightly incorrect if the last batch in the training dataloader has a smaller size but it's
                 # the best we can do.
                 num_train_samples = args.max_steps * total_train_batch_size
+                if args.include_tokens_per_second:
+                    num_train_tokens = (
+                        self.num_tokens(train_dataloader, args.max_steps) * args.gradient_accumulation_steps
+                    )
             else:
                 max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)
                 num_train_epochs = math.ceil(args.num_train_epochs)
                 num_train_samples = self.num_examples(train_dataloader) * args.num_train_epochs
+                if args.include_tokens_per_second:
+                    num_train_tokens = self.num_tokens(train_dataloader) * args.num_train_epochs
         elif args.max_steps > 0:  # Rely on max_steps when dataloader does not have a working size
             max_steps = args.max_steps
             # Setting a very large number of epochs so we go as many times as necessary over the iterator.
@@ -339,6 +288,8 @@ class OurGaudiTrainer(GaudiTrainer):
             num_update_steps_per_epoch = max_steps
             num_examples = total_train_batch_size * args.max_steps
             num_train_samples = args.max_steps * total_train_batch_size
+            if args.include_tokens_per_second:
+                num_train_tokens = self.num_tokens(train_dataloader, args.max_steps) * args.gradient_accumulation_steps
         else:
             raise ValueError(
                 "args.max_steps must be set to a positive value if dataloader does not have a length, was"
@@ -346,82 +297,187 @@ class OurGaudiTrainer(GaudiTrainer):
             )
 
         if DebugOption.UNDERFLOW_OVERFLOW in self.args.debug:
-            if self.args.n_gpu > 1:
-                # nn.DataParallel(model) replicates the model, creating new variables and module
-                # references registered here no longer work on other gpus, breaking the module
-                raise ValueError(
-                    "Currently --debug underflow_overflow is not supported under DP. Please use DDP"
-                    " (torch.distributed.launch)."
-                )
-            else:
-                debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
+            debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
-        delay_optimizer_creation = (
-            self.sharded_ddp is not None
-            and self.sharded_ddp != ShardedDDPOption.SIMPLE
-            or is_sagemaker_mp_enabled()
-            or self.fsdp is not None
-        )
-        if args.deepspeed:
-            deepspeed_engine, optimizer, lr_scheduler = deepspeed_init(
-                self, num_training_steps=max_steps, resume_from_checkpoint=resume_from_checkpoint
-            )
-            self.model = deepspeed_engine.module
-            self.model_wrapped = deepspeed_engine
-            self.deepspeed = deepspeed_engine
-            self.optimizer = optimizer
-            self.lr_scheduler = lr_scheduler
-        elif not delay_optimizer_creation:
+        delay_optimizer_creation = self.is_fsdp_enabled
+
+        # We need to reset the scheduler, as its parameters may be different on subsequent calls
+        if self._created_lr_scheduler:
+            self.lr_scheduler = None
+            self._created_lr_scheduler = False
+
+        if self.is_deepspeed_enabled:
+            self.optimizer, self.lr_scheduler = deepspeed_init(self, num_training_steps=max_steps)
+
+        if not delay_optimizer_creation:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
-            # pass
-        self.state = TrainerState()
+
+        self.state = TrainerState(
+            stateful_callbacks=[
+                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
+            ]
+        )
         self.state.is_hyper_param_search = trial is not None
+        self.state.train_batch_size = self._train_batch_size
+
+        # Compute absolute values for logging, eval, and save if given as ratio
+        if args.logging_steps is not None:
+            if args.logging_steps < 1:
+                self.state.logging_steps = math.ceil(max_steps * args.logging_steps)
+            else:
+                self.state.logging_steps = args.logging_steps
+        if args.eval_steps is not None:
+            if args.eval_steps < 1:
+                self.state.eval_steps = math.ceil(max_steps * args.eval_steps)
+            else:
+                self.state.eval_steps = args.eval_steps
+        if args.save_steps is not None:
+            if args.save_steps < 1:
+                self.state.save_steps = math.ceil(max_steps * args.save_steps)
+            else:
+                self.state.save_steps = args.save_steps
 
         # Activate gradient checkpointing if needed
         if args.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
+            import transformers.modeling_utils
+
+            if args.deepspeed:
+                from deepspeed.runtime.activation_checkpointing.checkpointing import (
+                    CheckpointFunction,
+                    non_reentrant_checkpoint,
+                )
+
+                # HACK because outputs should always be tuples
+                def hpu_deepspeed_checkpointing(function, *checkpoint_args, use_reentrant: Optional[bool] = None):
+                    """DeepSpeed activation checkpointing."""
+                    if use_reentrant is None:
+                        use_reentrant = True
+                    if use_reentrant:
+                        all_outputs = []
+                        CheckpointFunction.apply(function, all_outputs, *checkpoint_args)
+                    else:
+                        logger.info("DeepSpeed activation checkpointing=non_reentrant_checkpoint")
+                        all_outputs = non_reentrant_checkpoint(function, *checkpoint_args)
+
+                    # Always return a tuple
+                    # When all_outputs contains only one element, DeepSpeed returns this element instead of a tuple
+                    # which is not consistent with some models. See https://github.com/microsoft/DeepSpeed/issues/1057.
+                    return tuple(all_outputs)
+
+                torch.utils.checkpoint.checkpoint = hpu_deepspeed_checkpointing
+                transformers.modeling_utils.checkpoint = hpu_deepspeed_checkpointing
+            elif args.use_lazy_mode:
+                from .gradient_checkpointing import checkpoint as lazy_mode_checkpointing
+
+                torch.utils.checkpoint.checkpoint = lazy_mode_checkpointing
+                transformers.modeling_utils.checkpoint = lazy_mode_checkpointing
+
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
+
+            # Wrap `_gradient_checkpointing_func` in the model with `transformer_engine` `activation_checkpointing` context.
+            if self.accelerator.state.is_fp8_enabled:
+                FP8ContextWrapper.gradient_checkpointing_wrap(self.model)
+        else:
+            # Hack because `RegressionModel` in test_trainer.py doesn't have `gradient_checkpointing_disable`
+            if hasattr(self.model, "gradient_checkpointing_disable"):
+                self.model.gradient_checkpointing_disable()
 
         model = self._wrap_model(self.model_wrapped)
 
-        if is_sagemaker_mp_enabled() and resume_from_checkpoint is not None:
-            self._load_from_checkpoint(resume_from_checkpoint, model)
+        # as the model is wrapped, don't use `accelerator.prepare`
+        # this is for unhandled cases such as
+        # FSDP-XLA, SageMaker MP/DP, DataParallel, IPEX
+        use_accelerator_prepare = True if model is self.model else False
+
+        if delay_optimizer_creation:
+            if use_accelerator_prepare:
+                self._fsdp_qlora_plugin_updates()
+                self.model = self.accelerator.prepare(self.model)
+            self.create_optimizer_and_scheduler(num_training_steps=max_steps)
+
+        # prepare using `accelerator` prepare
+        if use_accelerator_prepare:
+            self.model.train()
+            if hasattr(self.lr_scheduler, "step"):
+                model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+            else:
+                # to handle cases wherein we pass "DummyScheduler" such as when it is specified in DeepSpeed config.
+                model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+                    self.model, self.optimizer, self.lr_scheduler
+                )
+        elif self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+            # In this case we are in DDP + LOMO, which should be supported
+            self.optimizer = self.accelerator.prepare(self.optimizer)
+
+        if self.is_fsdp_enabled:
+            self.model = self.model_wrapped = model
 
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
         if model is not self.model:
             self.model_wrapped = model
 
-        if delay_optimizer_creation:
-            self.create_optimizer_and_scheduler(num_training_steps=max_steps)
+        # backward compatibility
+        if self.is_deepspeed_enabled:
+            self.deepspeed = self.model_wrapped
 
-        # NOTE : currently only full ft is supported
-        if 'Adam' in args.trainer:
-            self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.adaptivity, weight_decay=args.weight_decay)
-        elif 'SGD' in args.trainer:
-            self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
+        # ckpt loading
+        if resume_from_checkpoint is not None:
+            if self.is_deepspeed_enabled:
+                deepspeed_load_checkpoint(
+                    self.model_wrapped, resume_from_checkpoint, load_module_strict=not _is_peft_model(self.model)
+                )
+            elif self.is_fsdp_enabled:
+                self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
+
+        ################# ZO added #################
+        if "Adam" in args.trainer:
+            self.optimizer = AdamW(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.adaptivity, weight_decay=args.weight_decay)
+        elif "SGD" in args.trainer:
+            self.optimizer = SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
         else:
-            raise ValueError(f"args.trainer should specify either 'Adam' or 'SGD', got {args.trainer}")
-        
+            raise ValueError(f"args.trainer {args.trainer} is not a ZO trainer. Do not define separated optimizer.")
+
+        if args.bcd:
+                self.init_block_coordinate_descent(model=model, base_optimizer=self.optimizer, block_ordering=args.bcd_ordering,
+                                                    include_embedding=args.include_embedding, include_lm_head=args.include_lm_head)
+        ############################################
+
         # Check if saved optimizer or scheduler states exist
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
+        
+        if self.gaudi_config.use_fused_clip_norm:
+            try:
+                from habana_frameworks.torch.hpex.normalization import FusedClipNorm
+            except ImportError as error:
+                error.msg = (
+                    f"Could not import 'FusedClipNorm' from 'habana_frameworks.torch.hpex.normalization'. {error.msg}."
+                )
+                raise error
+            self.FusedNorm = FusedClipNorm(
+                model.parameters(),
+                args.max_grad_norm,
+            )
 
         # important: at this point:
         # self.model         is the Transformers Model
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model), etc.
+        # FSDP(Transformers Model), Dynamo Optimized Module(Transformers Model) etc.
 
         # Train!
         logger.info("***** Running training *****")
-        logger.info(f"  Num examples = {num_examples}")
-        logger.info(f"  Num Epochs = {num_train_epochs}")
-        logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+        logger.info(f"  Num examples = {num_examples:,}")
+        logger.info(f"  Num Epochs = {num_train_epochs:,}")
+        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
+        if self.args.per_device_train_batch_size != self._train_batch_size:
+            logger.info(f"  Training with DataParallel so batch size has been adjusted to: {self._train_batch_size:,}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size:,}")
         logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-        logger.info(f"  Total optimization steps = {max_steps}")
-        logger.info(
-            f"  Number of trainable parameters = {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
-        )
+        logger.info(f"  Total optimization steps = {max_steps:,}")
+        logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
 
         self.state.epoch = 0
         start_time = time.time()
+        start_time_after_warmup = None
         epochs_trained = 0
         steps_trained_in_current_epoch = 0
         steps_trained_progress_bar = None
@@ -431,7 +487,9 @@ class OurGaudiTrainer(GaudiTrainer):
             os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
         ):
             self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
-            epochs_trained = self.state.global_step // num_update_steps_per_epoch
+            self.compare_trainer_and_checkpoint_args(self.args, self.state)
+            self._load_callback_state()
+            epochs_trained = int(self.state.global_step // num_update_steps_per_epoch)
             if not args.ignore_data_skip:
                 steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
                 steps_trained_in_current_epoch *= args.gradient_accumulation_steps
@@ -443,13 +501,20 @@ class OurGaudiTrainer(GaudiTrainer):
             logger.info(f"  Continuing training from global step {self.state.global_step}")
             if not args.ignore_data_skip:
                 logger.info(
-                    f"  Will skip the first {epochs_trained} epochs then the first {steps_trained_in_current_epoch} "
-                    "batches in the first epoch. If this takes a lot of time, you can add the `--ignore_data_skip` "
-                    "flag to your launch command, but you will resume the training on data already seen by your model."
+                    f"  Will skip the first {epochs_trained} epochs then the first"
+                    f" {steps_trained_in_current_epoch} batches in the first epoch."
                 )
-                if self.is_local_process_zero() and not args.disable_tqdm:
-                    steps_trained_progress_bar = tqdm(total=steps_trained_in_current_epoch)
-                    steps_trained_progress_bar.set_description("Skipping the first batches")
+
+        # In multi-worker training: broadcast model parameters from worker:0 to all the others.
+        # This must be done manually unless DistributedDataParallel is used.
+        if self.args.parallel_mode == ParallelMode.DISTRIBUTED and self.args.distribution_strategy == "fast_ddp":
+            from ..distributed import all_reduce_gradients
+
+            logger.debug(
+                f"Broadcasting the model parameters to assure that each of {self.args.world_size} workers start the training from the same point."
+            )
+            for param in model.parameters():
+                torch.distributed.broadcast(param.data, src=0)
 
         # Update the references
         self.callback_handler.model = self.model
@@ -474,40 +539,61 @@ class OurGaudiTrainer(GaudiTrainer):
 
         # tr_loss is a tensor to avoid synchronization of TPUs through .item()
         tr_loss = torch.tensor(0.0).to(args.device)
-        # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
+        # _total_loss_scalar is updated every time .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
-        model.zero_grad()
+        self._zero_model_grad(model)
+        _grad_norm: Optional[float] = None
+        _should_compute_grad_norm: bool = not self.accelerator.distributed_type == GaudiDistributedType.DEEPSPEED and (
+            # Gradient clipping
+            args.max_grad_norm is not None and args.max_grad_norm > 0
+        )
+
+        # attn_softmax_bf16 and use_flash_attention are enabled only for llama, qwen2, starcoder2, gemma and baichuan
+        # lazy_mode for llama, qwen2, starcoder2 and mistral
+        _should_update_inputs, _inputs_update = _get_input_update_settings(self.model, lazy_mode=args.use_lazy_mode)
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
-        # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
-        if not args.ignore_data_skip:
-            for epoch in range(epochs_trained):
-                is_random_sampler = hasattr(train_dataloader, "sampler") and isinstance(
-                    train_dataloader.sampler, RandomSampler
-                )
-                if is_torch_less_than_1_11 or not is_random_sampler:
-                    # We just need to begin an iteration to create the randomization of the sampler.
-                    # That was before PyTorch 1.11 however...
-                    for _ in train_dataloader:
-                        break
-                else:
-                    # Otherwise we need to call the whooooole sampler cause there is some random operation added
-                    # AT THE VERY END!
-                    _ = list(train_dataloader.sampler)
+        ################## ZO added ###################
+        if args.sparse_perturbation:
+            self.sparse_grad_rng = torch.Generator(device='cuda' if torch.cuda.is_available() else 'cpu')
+            self.gradient_sparsity = None  # None, float, or dict
+            
+            if args.sparse_gradient_group == "layer" or args.gradient_sparsity is None:
+                self.gradient_sparsity = args.gradient_sparsity
+                print(f"### layer-wise gradient sparsity = {self.gradient_sparsity}")
+            elif args.sparse_gradient_group == "global":
+                threshold = estimate_pretrained_model_magnitude_pruning_threshold(model, args.gradient_sparsity)
+                self.gradient_sparsity = compute_named_parameters_to_sparsity(model, threshold)
+                print(f"### global gradient sparsity, weight magnitude threshold = {threshold}")
+        ###############################################
 
+        if args.eval_on_start:
+            self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
+
+        if self.args.adjust_throughput:
+            self.log_evaluate_save_time = 0
+        else:
+            self.log_evaluate_save_time = None
+
+        hb_profiler = HabanaProfile(
+            warmup=self.args.profiling_warmup_steps,
+            active=self.args.profiling_steps,
+            record_shapes=self.args.profiling_record_shapes,
+            with_stack=self.args.profiling_with_stack,
+        )
+        hb_profiler.start()
+
+        total_batched_samples = 0
+        if _is_peft_model(self.model) and self.model.peft_type == PeftType.ADALORA:
+            self.model.base_model.peft_config[self.model.trainable_adapter_name].total_step = max_steps
+            if max_steps < self.model.base_model.peft_config[self.model.trainable_adapter_name].tfinal:
+                self.model.base_model.peft_config[self.model.trainable_adapter_name].tfinal = 0
         for epoch in range(epochs_trained, num_train_epochs):
-            if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
-                train_dataloader.sampler.set_epoch(epoch)
-            elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
-                train_dataloader.dataset.set_epoch(epoch)
-
-            if is_torch_tpu_available():
-                parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
-                epoch_iterator = parallel_loader
-            else:
-                epoch_iterator = train_dataloader
+            epoch_iterator = train_dataloader
+            if hasattr(epoch_iterator, "set_epoch"):
+                epoch_iterator.set_epoch(epoch)
 
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
@@ -523,8 +609,48 @@ class OurGaudiTrainer(GaudiTrainer):
             if epoch == epochs_trained and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
                 self._load_rng_state(resume_from_checkpoint)
 
+            rng_to_sync = False
+            steps_skipped = 0
+            if steps_trained_in_current_epoch > 0:
+                epoch_iterator = skip_first_batches(epoch_iterator, steps_trained_in_current_epoch)
+                steps_skipped = steps_trained_in_current_epoch
+                steps_trained_in_current_epoch = 0
+                rng_to_sync = True
+
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                if (
+                    args.throughput_warmup_steps > 0
+                    and (args.throughput_warmup_steps * args.gradient_accumulation_steps)
+                    == epoch * steps_in_epoch + step
+                ):
+                    start_time_after_warmup = time.time()
+
+                total_batched_samples += 1
+
+                if self.args.include_num_input_tokens_seen:
+                    main_input_name = getattr(self.model, "main_input_name", "input_ids")
+                    if main_input_name not in inputs:
+                        logger.warning(
+                            "Tried to track the number of tokens seen, however the current model is "
+                            "not configured properly to know what item is the input. To fix this, add "
+                            "a `main_input_name` attribute to the model class you are using."
+                        )
+                    else:
+                        self.state.num_input_tokens_seen += (
+                            torch.sum(
+                                self.accelerator.gather(
+                                    torch.tensor(
+                                        inputs[main_input_name].numel(), device=self.args.device, dtype=torch.int64
+                                    )
+                                )
+                            )
+                            .cpu()
+                            .item()
+                        )
+                if rng_to_sync:
+                    self._load_rng_state(resume_from_checkpoint)
+                    rng_to_sync = False
 
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
@@ -541,134 +667,140 @@ class OurGaudiTrainer(GaudiTrainer):
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                # MeZO added: estimate gradient
-                if "LOZO" in args.trainer or "MeZO" in args.trainer:
-                    tr_loss_step = self.zo_step(model, inputs, lowrank="LOZO" in args.trainer, kfac="KFAC" in args.trainer)
-                else:
-                    logger.info(f"Neither LOZO nor MeZO is specified in args.trainer, using the original training loop.")
-                    
-                    if (
-                        ((step + 1) % args.gradient_accumulation_steps != 0)
-                        and args.local_rank != -1
-                        and args._no_sync_in_gradient_accumulation
-                    ):
-                        # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
-                        with model.no_sync():
-                            tr_loss_step = self.training_step(model, inputs)
+                ################# ZO added #################
+                # resample sparse_grad_random_seed
+                if args.sparse_perturbation and (self.state.global_step % args.sparse_gradient_resample_steps == 0):
+                    self.sparse_grad_random_seed = np.random.randint(1000000000)
+
+                # update active block for block coordinate descent
+                if args.bcd and (self.state.global_step % args.bcd_interval == 0):
+                    self.update_active_blocks(model, block_ordering=args.bcd_ordering)
+                ############################################
+
+                # attn_softmax_bf16 and use_flash_attention is enabled only for llama, qwen2, starcoder2, gemma, baichuan and chatglm
+                # lazy_mode for llama, qwen2, starcoder2 and mistral
+                if _should_update_inputs:
+                    inputs.update(_inputs_update)
+
+                # TODO: keep syncs for fast DDP?
+                with self.accelerator.accumulate(model):
+                    ################# ZO added #################
+                    if "MeZO" in args.trainer:
+                        if args.lozo_perturbation:
+                            tr_loss_step = self.lowrank_zo_step(model, inputs, sanity_check=SANITY_CHECK)
+                        else:
+                            # zo training
+                            tr_loss_step = self.zo_step(model, inputs, sanity_check=SANITY_CHECK)
                     else:
+                        # regular training
                         tr_loss_step = self.training_step(model, inputs)
+                    ############################################
+                    
+                is_last_step_and_steps_less_than_grad_acc = (
+                    steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
+                )
+
+                is_optimization_step = (
+                    total_batched_samples % args.gradient_accumulation_steps == 0
+                    or
+                    # last step in epoch but step is always smaller than gradient_accumulation_steps
+                    is_last_step_and_steps_less_than_grad_acc
+                )
 
                 if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_tpu_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    args.parallel_mode == ParallelMode.DISTRIBUTED
+                    and args.distribution_strategy == "fast_ddp"
+                    and is_optimization_step
                 ):
+                    all_reduce_gradients(
+                        model, use_hpu_graphs=True
+                    )  # use HPU graphs for gradient fusion regardless of args.use_hpu_graphs_for_training setting
+
+                if args.logging_nan_inf_filter and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step)):
                     # if loss is nan or inf simply add the average of previous logged losses
                     tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
                 else:
+                    if tr_loss.device != tr_loss_step.device:
+                        raise ValueError(
+                            f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
+                        )
                     tr_loss += tr_loss_step
 
                 self.current_flos += float(self.floating_point_ops(inputs))
+                if args.use_lazy_mode:
+                    self.htcore.mark_step()
 
-                # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
-                if self.deepspeed:
-                    self.deepspeed.step()
+                if is_optimization_step:
+                    # the `or` condition of `is_last_step_and_steps_less_than_grad_acc` is not covered
+                    # in accelerate. So, explicitly enable sync gradients to True in that case.
+                    if is_last_step_and_steps_less_than_grad_acc:
+                        self.accelerator.gradient_state._set_sync_gradients(True)
 
-                if (step + 1) % args.gradient_accumulation_steps == 0 or (
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    steps_in_epoch <= args.gradient_accumulation_steps
-                    and (step + 1) == steps_in_epoch
-                ):
-                    # MeZO added: update model with the estimated gradient
-                    if "KFAC" in args.trainer:
-                        self.kfac_lowrank_zo_update()
-                    elif "LOZO" in args.trainer:
-                        self.lowrank_zo_update()
-                    elif "MeZO" in args.trainer:
-                        self.zo_update()
+                    if "MeZO" in args.trainer:
+                        self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
+                        if self.args.h_informed_perturbation:
+                            # update is already done above
+                            grad_norm = 0.0
+                        elif self.args.lozo_perturbation or self.args.subzero_perturbation or self.args.kfac_perturbation:
+                            grad_norm = self.lowrank_zo_update(sanity_check=SANITY_CHECK)
+                        else:
+                            grad_norm = self.zo_update(sanity_check=SANITY_CHECK)
+                        self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
                     else:
-                        # Gradient clipping
-                        if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
+                        # If the condition is true, we need to compute _grad_norm
+                        if _should_compute_grad_norm:
                             # deepspeed does its own clipping
-
-                            if self.do_grad_scaling:
-                                # Reduce gradients first for XLA
-                                if is_torch_tpu_available():
-                                    gradients = xm._fetch_gradients(self.optimizer)
-                                    xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
-                                # AMP: gradients need unscaling
-                                self.scaler.unscale_(self.optimizer)
-
-                            if is_sagemaker_mp_enabled() and args.fp16:
-                                self.optimizer.clip_master_grads(args.max_grad_norm)
-                            elif hasattr(self.optimizer, "clip_grad_norm"):
-                                # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                                self.optimizer.clip_grad_norm(args.max_grad_norm)
-                            elif hasattr(model, "clip_grad_norm_"):
-                                # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
-                                model.clip_grad_norm_(args.max_grad_norm)
+                            if self.gaudi_config.use_fused_clip_norm and args.use_habana:
+                                # TODO: to merge self.accelerator.clip_grad_norm_ when HMP is removed
+                                _grad_norm = self.FusedNorm.clip_norm(model.parameters())
                             else:
-                                # Revert to normal clipping otherwise, handling Apex or full precision
-                                nn.utils.clip_grad_norm_(
-                                    amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
+                                # Revert to normal clipping otherwise
+                                _grad_norm = self.accelerator.clip_grad_norm_(
+                                    model.parameters(),
                                     args.max_grad_norm,
                                 )
 
-                        # Optimizer step
-                        optimizer_was_run = True
-                        if self.deepspeed:
-                            pass  # called outside the loop
-                        elif is_torch_tpu_available():
-                            if self.do_grad_scaling:
-                                self.scaler.step(self.optimizer)
-                                self.scaler.update()
-                            else:
-                                xm.optimizer_step(self.optimizer)
-                        elif self.do_grad_scaling:
-                            scale_before = self.scaler.get_scale()
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            scale_after = self.scaler.get_scale()
-                            optimizer_was_run = scale_before <= scale_after
-                        else:
-                            self.optimizer.step()
+                        self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
 
-                        if optimizer_was_run and not self.deepspeed:
-                            self.lr_scheduler.step()
-                        model.zero_grad()
+                        self.optimizer.step()
 
+                        self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
+
+                        optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
+                        if optimizer_was_run:
+                            # Delay optimizer scheduling until metrics are generated
+                            if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                                self.lr_scheduler.step()
+
+                    self._zero_model_grad(model)
                     self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1) / steps_in_epoch
+                    self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                    if args.use_lazy_mode:
+                        self.htcore.mark_step()
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+                    self._maybe_log_save_evaluate(tr_loss, _grad_norm, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
+                hb_profiler.step()
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
             if step < 0:
                 logger.warning(
-                    "There seems to be not a single sample in your epoch_iterator, stopping training at step"
+                    "There seems not to be a single sample in your epoch_iterator, stopping training at step"
                     f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
                     f" num_steps ({max_steps}) higher than the number of available samples."
                 )
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+            self._maybe_log_save_evaluate(tr_loss, _grad_norm, model, trial, epoch, ignore_keys_for_eval)
 
-            if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
-                if is_torch_tpu_available():
-                    # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
-                    xm.master_print(met.metrics_report())
-                else:
-                    logger.warning(
-                        "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
-                        "configured. Check your training configuration if this is unexpected."
-                    )
             if self.control.should_training_stop:
                 break
+
+        hb_profiler.stop()
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -676,21 +808,29 @@ class OurGaudiTrainer(GaudiTrainer):
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         if args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
-            # Wait for everyone to get here so we are sur the model has been saved by process 0.
-            if is_torch_tpu_available():
-                xm.rendezvous("load_best_model_at_end")
-            elif args.local_rank != -1:
-                dist.barrier()
-            elif is_sagemaker_mp_enabled():
-                smp.barrier()
+            # Wait for everyone to get here so we are sure the model has been saved by process 0.
+            if args.parallel_mode == ParallelMode.DISTRIBUTED:
+                torch.distributed.barrier()
 
             self._load_best_model()
 
         # add remaining tr_loss
         self._total_loss_scalar += tr_loss.item()
-        train_loss = self._total_loss_scalar / self.state.global_step
+        effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
+        train_loss = self._total_loss_scalar / effective_global_step
 
-        metrics = speed_metrics("train", start_time, num_samples=num_train_samples, num_steps=self.state.max_steps)
+        # Warmup steps are removed from the calculation of speed metrics
+        num_samples_for_speed_metrics = num_train_samples - args.throughput_warmup_steps * total_train_batch_size
+        num_steps_for_speed_metrics = self.state.max_steps - args.throughput_warmup_steps
+        metrics = speed_metrics(
+            "train",
+            start_time,
+            num_samples=num_samples_for_speed_metrics,
+            num_steps=num_steps_for_speed_metrics,
+            num_tokens=num_train_tokens,
+            start_time_after_warmup=start_time_after_warmup,
+            log_evaluate_save_time=self.log_evaluate_save_time,
+        )
         self.store_flos()
         metrics["total_flos"] = self.state.total_flos
         metrics["train_loss"] = train_loss
@@ -704,94 +844,62 @@ class OurGaudiTrainer(GaudiTrainer):
         run_dir = self._get_output_dir(trial)
         checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
 
-        # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint.
-        if self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
+        # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint and process allowed to save.
+        if self.args.should_save and self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
             for checkpoint in checkpoints_sorted:
-                if checkpoint != self.state.best_model_checkpoint:
+                if not os.path.samefile(checkpoint, self.state.best_model_checkpoint):
                     logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
-                    shutil.rmtree(checkpoint)
+                    shutil.rmtree(checkpoint, ignore_errors=True)
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
 
+        # Wait for the checkpoint to be uploaded.
+        self._finish_current_push()
+
+        # After training we make sure to retrieve back the original forward pass method
+        # for the embedding layer by removing the forward post hook.
+        if self.neftune_noise_alpha is not None:
+            self._deactivate_neftune(self.model)
+
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
-
-    # =========================================== LOZO Functions ==============================================================
-
-    def zo_perturb_parameters(self, random_seed=None, scaling_factor=1):
+    # =========================================== ZO Functions ==============================================================
+    def get_grad_sparsity_by_name(self, name):
+        if self.gradient_sparsity is None:
+            return None
+        elif isinstance(self.gradient_sparsity, float):
+            return self.gradient_sparsity
+        elif isinstance(self.gradient_sparsity, dict):
+            return self.gradient_sparsity[name]
+    
+    def zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=0, sampling_order=0, sanity_check=False):
         """
         Perturb the parameters with random vector z.
         Input: 
         - random_seed: random seed for MeZO in-place perturbation (if it's None, we will use self.zo_random_seed)
         - scaling_factor: theta = theta + scaling_factor * z * eps
         """
+        args = self.args
 
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+
+        if args.sparse_perturbation:
+            self.sparse_grad_rng.manual_seed(self.sparse_grad_random_seed)
         
         for name, param in self.named_parameters_to_optim:
-            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            
+            if args.sparse_perturbation:
+                grad_sparsity = self.get_grad_sparsity_by_name(name)
+                if grad_sparsity is not None:
+                    z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+
             param.data = param.data + scaling_factor * z * self.args.zo_eps
 
-    def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1):
-        """
-        Perturb the parameters with low-rank perturbation.
-        """
-        args = self.args
-        step = self.step
-
-        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
-        
-        for name, param in self.named_parameters_to_optim:
-            if param.data.ndim >= 2:
-                if step % args.step_interval == 0:
-                    v = torch.randn(param.data.size(1), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    self.v[name] = v
-                else:
-                    v = self.v[name]
-                u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                param.data = param.data + scaling_factor * u@v.t() * self.args.zo_eps
-
-            else:
-                # for bias
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.data = param.data + scaling_factor * z * self.args.zo_eps
-
-
-    def kfac_lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1):
-        """
-        Perturb the parameters with Kronecker factored low-rank perturbation.
-        """
-        args = self.args
-        step = self.step
-
-        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
-        
-        for name, param in self.named_parameters_to_optim:
-            if param.data.ndim >= 2:
-                if step % args.step_interval == 0:
-                    u = torch.randn(param.data.size(0), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    v = torch.randn(param.data.size(1), args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                    u, v = u / torch.linalg.norm(u, dim=0), v / torch.linalg.norm(v, dim=0)
-                    self.u[name] = u
-                    self.v[name] = v
-
-                else:
-                    u = self.u[name]
-                    v = self.v[name]
-
-                z = torch.randn(param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                
-                # Sanity Check
-                # if step % args.step_interval == 0:
-                #     self.sanity_check_z[name] = z
-            
-                param.data = param.data + scaling_factor * ((u@(u.t()@z))@v)@v.t() * self.args.zo_eps
-
-            else:
-                # for bias
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.data = param.data + scaling_factor * z * self.args.zo_eps
+            # Sanity Check
+            if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                self.sanity_check[sampling_order][order][name] = z.clone()
 
     def zo_forward(self, model, inputs):
         """
@@ -809,8 +917,8 @@ class OurGaudiTrainer(GaudiTrainer):
             if self.args.n_gpu > 1:
                 # Warning: this is copied from the original Huggingface Trainer. Untested.
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
-        return loss.detach()
 
+        return loss.detach()
 
     def zo_forward_nondiff(self, model, inputs):
         """
@@ -825,17 +933,17 @@ class OurGaudiTrainer(GaudiTrainer):
             outputs = self.model.generate(
                 inputs["input_ids"], do_sample=args.sampling, temperature=args.temperature, 
                 num_beams=args.num_beams, top_p=args.top_p, top_k=args.top_k, max_new_tokens=min(args.max_new_tokens, args.max_length - inputs["input_ids"].size(1)), 
-                num_return_sequences=1, eos_token_id=[self.tokenizer.encode(args.eos_token, add_special_tokens=False)[-1], self.tokenizer.eos_token_id],
+                num_return_sequences=1, eos_token_id=[self.processing_class.encode(args.eos_token, add_special_tokens=False)[-1], self.processing_class.eos_token_id],
             )
             output_text = []
             for i in range(len(outputs)):
-                output_text.append(self.tokenizer.decode(outputs[i][inputs["input_ids"].size(1):], skip_special_tokens=True).strip())
+                output_text.append(self.processing_class.decode(outputs[i][inputs["input_ids"].size(1):], skip_special_tokens=True).strip())
             f1s = [f1(output_text[i], inputs['gold'][i]) for i in range(len(output_text))]
         
         return -torch.tensor(np.mean(f1s), dtype=torch.float32)
 
 
-    def zo_step(self, model, inputs, lowrank=False, kfac=False):
+    def zo_step(self, model, inputs, sanity_check=False):
         """
         Estimate gradient by Lowrank-zo. Return the loss from f(theta + uv^t)
         """
@@ -844,139 +952,485 @@ class OurGaudiTrainer(GaudiTrainer):
             self.step += 1
         else:
             self.step = 0
-            self.v = {}
-            self.u = {}
+            self.s_u = {}
+            if sanity_check:
+                self.sanity_check = [{}, {}, {}]
+
+        loss = self.zo_forward(model, inputs)
 
         self.named_parameters_to_optim = []
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.named_parameters_to_optim.append((name, param))
 
-        if kfac:
-            perturb_parameters_func = self.kfac_lowrank_zo_perturb_parameters
-        elif lowrank:
-            perturb_parameters_func = self.lowrank_zo_perturb_parameters
-        else:
-            perturb_parameters_func = self.zo_perturb_parameters
+        perturb_parameters_func = self.zo_perturb_parameters
         
-
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
 
         # First function evaluation
-        perturb_parameters_func(scaling_factor=1)
+        self.zo_perturb_parameters(scaling_factor=1, sanity_check=sanity_check, order=0)
         loss1 = self.zo_forward(model, inputs)
 
         # Second function evaluation
-        perturb_parameters_func(scaling_factor=-2)
+        self.zo_perturb_parameters(scaling_factor=-2, sanity_check=sanity_check, order=1)
         loss2 = self.zo_forward(model, inputs)
 
         self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
 
         # No gradient accumulation support
-        assert self.args.gradient_accumulation_steps == 1
+        assert args.gradient_accumulation_steps == 1
 
         # Reset model back to its parameters at start of step
-        perturb_parameters_func(scaling_factor=1)
-        return loss1
+        self.zo_perturb_parameters(scaling_factor=1, sanity_check=sanity_check, order=2)
+        
+        return loss
 
-    def zo_update(self, model):
+    def zo_update(self, sanity_check=False):
         """
         Update the parameters with the estimated gradients.
         """
         args = self.args
+        if args.sparse_perturbation and args.block_sparsity:
+            num_attention_heads = self.num_attention_heads
+        # import pdb; pdb.set_trace()
 
         # Reset the random seed for sampling zs
-        torch.manual_seed(self.zo_random_seed)     
+        torch.manual_seed(self.zo_random_seed)
 
+        grad_norm_list = []
         for name, param in self.named_parameters_to_optim:
             # Resample z
-            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+
+            # sanity check
+            if sanity_check and name == SANITY_CHECK_MODULE_NAME:
+                pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
+                pert1_pert2 = torch.allclose(self.sanity_check[0][0][name], self.sanity_check[0][1][name], atol=1e-5)
+                pert2_pert3 = torch.allclose(self.sanity_check[0][1][name], self.sanity_check[0][2][name], atol=1e-5)
+                if not (pert_pert1 and pert1_pert2 and pert2_pert3):
+                    import pdb; pdb.set_trace()
+
             if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
                 param.grad = self.projected_grad * z + args.weight_decay * param.data
             else:
                 param.grad = self.projected_grad * z
+
+            # sparse random perturbations
+            if args.sparse_perturbation:
+                grad_sparsity = self.get_grad_sparsity_by_name(name)
+                if grad_sparsity is not None:
+                    param.grad[fast_random_mask_like(param.grad, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+
+            # Gradient clipping
+            if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                parameter_ratio = np.sqrt(param.numel() / self.total_trainable_parameters)
+                grad_norm_list.append(self.accelerator.clip_grad_norm_(
+                    param,
+                    args.max_grad_norm * parameter_ratio,
+                ).item())
+                
+            # import pdb;pdb.set_trace()
+            # more mem-efficient:
+            # run optimizer.step here to avoid caching all grad.
             self.optimizer.step()
             param.grad = None
 
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
-
-    def lowrank_zo_update(self):
-        args = self.args
-
-        # Reset the random seed for sampling
-        torch.manual_seed(self.zo_random_seed)     
-
-        for name, param in self.named_parameters_to_optim:
-            if param.data.ndim >= 2:
-                v = self.v[name]
-                u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * u@v.t()
-            else:
-                # Resample z for bias
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * z
             
-            # import pdb;pdb.set_trace()
-            # more mem-efficient:
-            # run optimizer.step here to avoid caching all grad.
-            self.optimizer.step()
-            param.grad = None # avoid further update.
-        
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
-
-    def kfac_lowrank_zo_update(self):
+        return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
+    
+    ############## Low-rank Random Perturbation Functions ##############
+    def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1, order=-1, sanity_check=False):
         args = self.args
+        step = self.step
 
-        # Reset the random seed for sampling
-        torch.manual_seed(self.zo_random_seed)     
+        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
 
         for name, param in self.named_parameters_to_optim:
             if param.data.ndim >= 2:
-                u = self.u[name]
-                v = self.v[name]
+                if step % args.lowrank_step_interval == 0:
+                    v = torch.normal(mean=0, std=1, size=(param.data.size(1), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                    self.v[name] = v
+                else:
+                    v = self.v[name]
                 
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * ((u @ (u.t() @ z)) @ v) @ v.t()
-            else:
-                # Resample z for bias
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * z
+                u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)               
+                param.data = param.data + scaling_factor * u@v.t() * args.zo_eps
             
+            else:
+                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                param.data = param.data + scaling_factor * z * args.zo_eps
+
+    def lowrank_zo_step(self, model, inputs, sanity_check=False):
+        """
+        Estimate gradient by Lowrank-zo. Return the loss from f(theta + uv^t)
+        """
+        args = self.args
+        
+        if hasattr(self, 'step'):
+            self.step += 1
+        else:
+            self.step = 0
+            self.v = {}
+            if sanity_check:
+                self.sanity_check = [{}, {}, {}]
+
+        loss = self.zo_forward(model, inputs)
+
+        self.named_parameters_to_optim = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.named_parameters_to_optim.append((name, param))
+        
+        # Sample the random seed for sampling 
+        self.zo_random_seed = np.random.randint(1000000000)
+
+        # First function evaluation
+        self.lowrank_zo_perturb_parameters(scaling_factor=1, sanity_check=sanity_check, order=0)
+        loss1 = self.zo_forward(model, inputs)
+
+        # Second function evaluation
+        self.lowrank_zo_perturb_parameters(scaling_factor=-2, sanity_check=sanity_check, order=1)
+        loss2 = self.zo_forward(model, inputs)
+
+        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+
+        # No gradient accumulation support
+        assert args.gradient_accumulation_steps == 1
+
+        # Reset model back to its parameters at start of step
+        self.lowrank_zo_perturb_parameters(scaling_factor=1, sanity_check=sanity_check, order=2)
+        
+        return loss
+
+    def lowrank_zo_update(self, sanity_check=False):
+        """
+        Update the parameters with the estimated gradients.
+        """
+        args = self.args
+        step = self.step
+
+        # Reset the random seed for sampling zs
+        torch.manual_seed(self.zo_random_seed)
+
+        grad_norm_list = []
+        for name, param in self.named_parameters_to_optim:
+            if param.data.ndim >= 2:
+                if step % args.lowrank_step_interval == 0:
+                    v = self.v[name]    
+                    # # dummy sampling for the reproducibility of u
+                    # v_ = torch.normal(mean=0, std=1, size=(param.data.size(1), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                    # del v_
+                else:
+                    v = self.v[name]
+                
+                u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                grad = self.projected_grad * u@v.t()
+
+            else:
+                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                grad = self.projected_grad * z
+
+            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                param.grad = grad + args.weight_decay * param.data
+            else:
+                param.grad = grad
+
+            # Gradient clipping
+            if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                parameter_ratio = np.sqrt(param.numel() / self.total_trainable_parameters)
+                grad_norm_list.append(self.accelerator.clip_grad_norm_(
+                    param,
+                    args.max_grad_norm * parameter_ratio,
+                ).item())
+                
             # import pdb;pdb.set_trace()
             # more mem-efficient:
             # run optimizer.step here to avoid caching all grad.
             self.optimizer.step()
-            param.grad = None # avoid further update.
-        
+            param.grad = None
+
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
+            
+        return np.sqrt(sum(grad_norm ** 2 for grad_norm in grad_norm_list))
 
-    def random_gaussian_matrix(self, m, n, device, dtype, random_seed=None):
-        if random_seed is not None:
-            torch.manual_seed(random_seed)
+    ############## Block Coordinate Descent Functions ##############
+    def infer_param_groups(self, model, include_embedding=False, include_lm_head=False):
+        """automatic inference of the parameter groups based on the parameter names.
+        divide groups into:
+            * embedding
+            * transformer layers
+            * lm_head and others
 
-        random_matrix = torch.randn(m, n, device=device, dtype=dtype)
-        return random_matrix
+        Reference : https://github.com/Ledzy/BAdam/blob/12511504e53face3d2612f5bb4bac3a02afa817e/src/badam/block_optim.py#L143
+        """
 
+        block_prefix_list = []
+        lm_head_and_other_params = []
+        embed_pattern = r'.*embed[^.]*\.'
+        layer_pattern = r'.*layers.[^.]*\.'
+
+        for name, _ in model.named_parameters():
+            if any(prefix[0] in name for prefix in block_prefix_list):
+                continue
+            
+            if re.findall(layer_pattern, name):
+                block_prefix_list.append(re.findall(layer_pattern, name))
+            elif re.findall(embed_pattern, name) and include_embedding:
+                block_prefix_list.append(re.findall(embed_pattern, name))
+            else:
+                lm_head_and_other_params.append(name)
+        
+        if include_lm_head:
+            block_prefix_list.append(lm_head_and_other_params)
+
+        return block_prefix_list
+    
+    def init_block_coordinate_descent(self, model, base_optimizer, block_ordering="random", active_modules=[], include_embedding=False, include_lm_head=False):
+        
+        assert base_optimizer is not None, "base_optimizer should be initialized before init_block_coordinate_descent."
+        self.active_modules = active_modules
+        self.block_prefix_list = self.infer_param_groups(model, include_embedding=include_embedding, include_lm_head=include_lm_head)
+        self.block_num = len(self.block_prefix_list)
+
+        if block_ordering == "random":
+            self.block_order = torch.randperm(self.block_num).tolist()
+        
+        self.block_optimizer_defaults = base_optimizer.defaults
+
+    def update_active_blocks(self, model, block_ordering="random"):
+        """
+        Update the active blocks for block coordinate descent and re-initialize the optimizer to flush the optimizer states.
+        """
+        assert hasattr(self, 'block_prefix_list') and hasattr(self, 'block_num'), "Block prefix list should be initialized properly."
+        if block_ordering == "random":
+            if len(self.block_order) == 0:
+                self.block_order = torch.randperm(self.block_num).tolist()
+                logger.info("Next block epoch's order has been updated")
+            self.current_block_idx = self.block_order.pop()
+        elif block_ordering == "ascending":
+            if hasattr(self, 'current_block_idx'):
+                self.current_block_idx = (self.current_block_idx + 1) % self.block_num
+            else:
+                self.current_block_idx = 0
+        elif block_ordering == "descending":
+            if hasattr(self, 'current_block_idx'):
+                self.current_block_idx = (self.current_block_idx - 1) % self.block_num
+            else:
+                self.current_block_idx = self.block_num - 1
+        else:
+            raise ValueError(f"{block_ordering} is not a valid block ordering")
+
+        trainable_param_groups = [
+            {
+                'params': [],
+                'weight_decay': self.optimizer.param_groups[0]['weight_decay'],
+                **self.block_optimizer_defaults
+            },
+            {
+                'params': [],
+                "weight_decay": 0.0,
+                **self.block_optimizer_defaults
+            }
+        ]
+
+        # Set param.requires_grad = False to every inactivated block
+        self.active_param_prefixs = self.block_prefix_list[self.current_block_idx] + self.active_modules
+        for name, param in model.named_parameters():
+            if not any(p in name for p in self.active_param_prefixs):
+                param.requires_grad_(False)
+                param.grad = None
+            else:
+                param.requires_grad_(True)
+                
+                if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                    trainable_param_groups[0]['params'].append(param)
+                else:
+                    trainable_param_groups[1]['params'].append(param)
+
+        # remove the empty param groups
+        trainable_param_groups[:] = [pg for pg in trainable_param_groups if len(pg["params"]) != 0]
+        self.optimizer.param_groups = trainable_param_groups
+        if self.args.state_flush:
+            self.optimizer.state = defaultdict(dict) # flush the optimizer state
+    
     ############## Misc overload functions ##############
-
-
     def _set_signature_columns_if_needed(self):
         """
         We overload this function for non-differentiable objective training to pass "gold" -- the gold text for the task
         """
         if self._signature_columns is None:
             # Inspect model forward signature to keep only the arguments it accepts.
-            signature = inspect.signature(self.model.forward)
+            model_to_inspect = self.model
+            if _is_peft_model(self.model):
+                if hasattr(self.model, "get_base_model"):
+                    model_to_inspect = self.model.get_base_model()
+                else:
+                    # PeftMixedModel do not provide a `get_base_model` method
+                    model_to_inspect = self.model.base_model.model
+            signature = inspect.signature(model_to_inspect.forward)
             self._signature_columns = list(signature.parameters.keys())
             # Labels may be named label or label_ids, the default data collator handles that.
             self._signature_columns += list(set(["label", "label_ids"] + self.label_names))
             self._signature_columns += ["gold"]
 
+    def forward(self, input_ids, option_len=None, generation=False):
+        """
+        Given input_ids and the length of the option, return the log-likelihood of each token in the option.
+        For generation tasks, return the generated text.
+        This function is only for inference
+        """
+        input_ids = torch.tensor([input_ids]).to(self.model.device)
+
+        if generation:
+            args = self.args
+            # Autoregressive generation
+            outputs = self.model.generate(
+                input_ids, do_sample=args.sampling, temperature=args.temperature, 
+                num_beams=args.num_beams, top_p=args.top_p, top_k=args.top_k, max_new_tokens=min(args.max_new_tokens, args.max_length - input_ids.size(1)), 
+                num_return_sequences=1, eos_token_id=[self.processing_class.encode(args.eos_token, add_special_tokens=False)[-1], self.processing_class.eos_token_id],
+            )
+            # For generation, directly return the text output
+            output_text = self.processing_class.decode(outputs[0][input_ids.size(1):], skip_special_tokens=True).strip()
+            return output_text
+        else:
+            with torch.inference_mode():
+                self.model.eval()
+                logits = self.model(input_ids=input_ids).logits
+            labels = input_ids[0, 1:]
+            logits = logits[0, :-1] 
+            log_probs = F.log_softmax(logits, dim=-1)
+
+            selected_log_probs = log_probs[torch.arange(len(labels)).to(labels.device), labels]
+            selected_log_probs = selected_log_probs.cpu().detach()
+            # Only return the option (candidate) part
+            return selected_log_probs[-option_len:]
+
+    def one_step_pred(self, train_samples, eval_sample, verbose=False):
+        """
+        Return the prediction on the eval sample. In ICL, use train_samples as demonstrations
+        """
+        verbose = verbose or self.args.verbose
+        if verbose:
+            logger.info("========= Example =========")
+            logger.info(f"Candidate: {eval_sample.candidates}")
+            logger.info(f"Correct candidate: {eval_sample.correct_candidate}")
+
+        # Encode (add prompt and tokenize) the sample; if multiple-choice/classification, encode all candidates (options)
+        encoded_candidates, option_lens = encode_prompt(
+            self.task, self.task.get_template(), train_samples, eval_sample, self.processing_class, max_length=self.args.max_length, 
+            generation=self.task.generation, max_new_tokens=self.args.max_new_tokens
+        )
+
+        # Calibration
+        if self.args.sfc or self.args.icl_sfc:
+            sfc_encoded_candidates, sfc_option_lens = encode_prompt(self.task, self.task.get_template(), 
+                train_samples, eval_sample, self.processing_class, max_length=self.args.max_length,
+                sfc=self.args.sfc, icl_sfc=self.args.icl_sfc, generation=self.task.generation, 
+                max_new_tokens=self.args.max_new_tokens
+            )
+
+        outputs = []
+        if self.task.generation:
+            # For generation tasks, return the autoregressively-generated text
+            output_text = self.forward(encoded_candidates[0], generation=True)
+            if verbose:
+                logger.info("=== Prompt ===")
+                logger.info(self.processing_class.decode(encoded_candidates[0]))
+                logger.info(f"Output: {output_text}") 
+            return Prediction(correct_candidate=eval_sample.correct_candidate, predicted_candidate=output_text)
+        else:
+            # For classification/multiple-choice, calculate the probabilities of all candidates
+            for candidate_id, encoded_candidate in enumerate(encoded_candidates):
+                selected_log_probs = self.forward(encoded_candidate, option_len=option_lens[candidate_id])
+                if verbose:
+                    if candidate_id == 0:
+                        logger.info("=== Candidate %d ===" % candidate_id)
+                        logger.info(self.processing_class.decode(encoded_candidate))
+                    else:
+                        logger.info("=== Candidate %d (without context)===" % candidate_id)
+                        logger.info(self.processing_class.decode(encoded_candidate).split(self.task.train_sep)[-1])
+                    logger.info(f"Log probabilities of the option tokens: {selected_log_probs}")
+
+                if self.args.sfc or self.args.icl_sfc:
+                    sfc_selected_log_probs = self.forward(sfc_encoded_candidates[candidate_id], option_len=sfc_option_lens[candidate_id])
+                    if verbose:
+                        logger.info("=== Candidate %d (without context) SFC ===" % candidate_id)
+                        logger.info(self.processing_class.decode(sfc_encoded_candidates[candidate_id]).split(self.task.train_sep)[-1])
+                        logger.info(f"Log probabilities of the option tokens: {sfc_selected_log_probs}")
+
+                outputs.append({"log_probs": selected_log_probs, "sfc_log_probs": sfc_selected_log_probs if self.args.sfc or self.args.icl_sfc else None})
+
+            if self.args.sfc or self.args.icl_sfc:
+                # Calibrated probabilities (surface form competition; https://arxiv.org/pdf/2104.08315.pdf)
+                # log p(candidate | input) = log p_lm(candidate | input) - log p_lm(candidate | sfc prompt)
+                scores = [x['log_probs'].sum().item() - x['sfc_log_probs'].sum().item() for x in outputs]
+            else:
+                # (Default) length-normalized log probabilities
+                # log p(candidate | input) = log p_lm(candidate | input) / |candidate #tokens|
+                scores = [x['log_probs'].mean().item() for x in outputs]
+
+            if verbose:
+                logger.info(f"Prediction scores: {scores}")
+
+            if isinstance(eval_sample.correct_candidate, list):
+                # For some datasets there are multiple correct answers
+                correct_candidate_id = [eval_sample.candidates.index(c) for c in eval_sample.correct_candidate]
+            else:
+                correct_candidate_id = eval_sample.candidates.index(eval_sample.correct_candidate)
+
+            return Prediction(correct_candidate=correct_candidate_id, predicted_candidate=int(np.argmax(scores)))
     
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+
+        metrics = {}
+        # Prediction loop
+        predictions = []
+        for eval_id, eval_sample in enumerate(tqdm(self.eval_samples)):
+            predictions.append(
+                self.one_step_pred([], eval_sample, verbose=(eval_id < 3))
+            )
+
+        # Calculate metrics
+        metric_name = getattr(self.task, "metric_name", "accuracy")
+        metrics[f"eval_{metric_name}"]=calculate_metric(predictions, metric_name)
+
+        # Prediction loop
+        predictions = []
+        for dev_id, dev_sample in enumerate(tqdm(self.dev_samples)):
+            predictions.append(
+                self.one_step_pred([], dev_sample, verbose=(dev_id < 3))
+            )
+
+        # Calculate metrics 
+        metrics[f"dev_{metric_name}"]=calculate_metric(predictions, metric_name)
+        logger.info(metrics)
+        self.log(metrics)
+
+        if hasattr(self, 'best_eval_metrics'):
+            if self.best_eval_metrics[f"best_eval_{metric_name}"] < metrics[f"eval_{metric_name}"]:
+                self.best_eval_metrics[f"best_eval_{metric_name}"] = metrics[f"eval_{metric_name}"]
+            if self.best_eval_metrics[f"best_dev_{metric_name}"] < metrics[f"dev_{metric_name}"]:
+                if self.args.early_stop:
+                    self.patience = 0
+                self.best_eval_metrics[f"best_dev_{metric_name}"] = metrics[f"dev_{metric_name}"]
+            else:
+                if self.args.early_stop:
+                    self.patience += 1
+                    if self.patience >= self.args.patience:
+                        self.control.should_training_stop = True
+        else:
+            if self.args.early_stop:
+                self.patience = 0
+            self.best_eval_metrics = {f"best_eval_{metric_name}": metrics[f"eval_{metric_name}"], f"best_dev_{metric_name}": metrics[f"dev_{metric_name}"]}
+        self.log(self.best_eval_metrics)
+    
+
+    ############## Misc overload functions ##############
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         """
         We overload this function to fix an FSDP saving bug (before fix, it will likely cause OOM) 

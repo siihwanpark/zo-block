@@ -60,19 +60,11 @@ class OurArguments(GaudiTrainingArguments):
 
     # Training
     trainer: str = "none" 
-    ## options
-    ## - none: no training -- for zero-shot or in-context learning (ICL)
-    ## - regular: regular huggingface trainer -- for fine-tuning
-    ## - MeZO: zeroth-order (MeZO) training
-    ## - LOZO: low rank zeroth-order (LOZO) training
-    ## - KFAC-LOZO: low rank zeroth-order (KFAC) training
     only_train_option: bool = True # whether to only train the option part of the input
     train_as_classification: bool = False # take the log likelihood of all options and train as classification 
 
     # LOZO
     zo_eps: float = 1e-3 # eps in LOZO
-    step_interval: int = 50 # $\nu$ in LOZO
-    rank_r: int = 2 # rank r in LOZO
 
     # Prefix tuning
     prefix_tuning: bool = False # whether to use prefix tuning
@@ -121,7 +113,30 @@ class OurArguments(GaudiTrainingArguments):
     beta2: float = 0.999
     adaptivity: float = 1e-08
     weight_decay: float = 0.0
-    momentum: float = 0.9
+    momentum: float = 0.0
+
+    # 3. Sparse random perturbation
+    sparse_perturbation: bool = False # sparse perturbation
+    gradient_sparsity: float = None
+    sparse_gradient_group: str = "layer"
+    sparse_gradient_resample_steps: int = 1
+
+    # 4. Low-rank random perturbation
+    lozo_perturbation: bool = False # LOZO-like low-rank random perturbation
+    lowrank_step_interval: int = 50 # $\nu$ in LOZO
+    rank_r: int = 2 # rank r in LOZO
+
+    # 5. Block-coordinate random perturbation
+    bcd: bool = False # Use of BAdam
+    bcd_ordering: str = "random" # block ordering for BAdam
+    bcd_interval: int = 100 # K for BADam
+    state_flush: bool = False # flush the optimizer state after one block epoch
+    include_embedding: bool = False # Include embedding layer for BAdam
+    include_lm_head: bool = False # Include lm_head for BAdam
+    
+    early_stop: bool = False # Use early stopping
+    patience: int = 10
+    delete_ckpts_at_end: bool = True
 
     # Gaudi-specific arguments
     use_habana: bool = field(default=True, metadata={"help": "Whether to use Gaudi HPU for training."})
@@ -162,41 +177,23 @@ class Framework:
                 # Untie embeddings/LM head
                 logger.warn("Untie embeddings and LM head")
                 config.tie_word_embeddings = False
-            if self.args.head_tuning:
-                # Head tuning
-                raise NotImplementedError("HPU not implemented for head tuning")
-
-                from ht_opt import OPTForCausalLM
-                model = OPTForCausalLM.from_pretrained(
+            
+            # Auto device loading
+            torch_dtype = torch.float32
+            if self.args.load_float16:
+                torch_dtype = torch.float16
+            elif self.args.load_bfloat16:
+                torch_dtype = torch.bfloat16
+            
+            if "opt" in args.model_name:
+                model = GaudiOPTForCausalLM.from_pretrained(
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
-                )
-                
-            elif self.args.no_auto_device:
-                # No auto device (use for FSDP)
-                raise NotImplementedError("HPU not implemented for no-auto-device")
-
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.args.model_name if self.args.model_path is None else self.args.model_path,
-                    config=config,
+                    device_map='cpu',
+                    torch_dtype=torch_dtype,
                 )
             else:
-                # Auto device loading
-                torch_dtype = torch.float32
-                if self.args.load_float16:
-                    torch_dtype = torch.float16
-                elif self.args.load_bfloat16:
-                    torch_dtype = torch.bfloat16
-                
-                if "opt" in args.model_name:
-                    model = GaudiOPTForCausalLM.from_pretrained(
-                        self.args.model_name if self.args.model_path is None else self.args.model_path,
-                        config=config,
-                        device_map='cpu',
-                        torch_dtype=torch_dtype,
-                    )
-                else:
-                    raise NotImplementedError(f"HPU not implemented for this model, {args.model_name}")
+                raise NotImplementedError(f"HPU not implemented for this model, {args.model_name}")
             
             model.to(torch.device("hpu"))
             model.eval()
@@ -437,8 +434,8 @@ class Framework:
             collator = DataCollatorForTokenClassification
 
         gaudi_config = GaudiConfig.from_pretrained('habana/llama')
-        if "LOZO" in self.args.trainer or "MeZO" in self.args.trainer:
-            trainer = OurTrainer(
+        if "MeZO" in self.args.trainer:
+            trainer = OurGaudiTrainer(
                 model=self.model, 
                 args=self.args,
                 train_dataset=train_dataset, 
@@ -447,6 +444,13 @@ class Framework:
                 data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
                 gaudi_config=gaudi_config,
             )
+
+        ############### added for inter-training evaluation ################
+        trainer.eval_samples = eval_samples
+        trainer.dev_samples = dev_samples
+        trainer.task = self.task
+        ####################################################################
+
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
 
@@ -499,6 +503,32 @@ def result_file_tag(args):
 def main():
     args = parse_args()
 
+    model_name = args.model_name.split('/')[-1].strip()
+    run_name = f"{model_name}_{args.trainer}"
+    run_name += f"_ft_{args.task_name}_lr_{args.learning_rate:.0e}_bsz_{args.per_device_train_batch_size}_steps_{args.max_steps}"
+    if 'SGD' in args.trainer:
+        run_name += f"_m_{args.momentum}"
+    if args.sparse_perturbation:
+        run_name += f"_sparse_p{args.gradient_sparsity}_group_{args.sparse_gradient_group}"
+    
+    if args.lozo_perturbation:
+        run_name += f"_lozo_r{args.rank_r}_nu{args.lowrank_step_interval}"
+    
+    if args.bcd:
+        run_name += f"_bcd_{args.bcd_ordering}_K{args.bcd_interval}"
+        if args.state_flush:
+            run_name += "_state_flush"
+        if args.include_embedding:
+            run_name += "_embed"
+        if args.include_lm_head:
+            run_name += "_lm_head"
+
+    if args.max_grad_norm > 0:
+        run_name += f"_max_grad_norm_{args.max_grad_norm}"
+        
+    wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
+    wandb.init(project="mezo-gaudi", name=run_name, config=args)
+
     set_seed(args.seed)
     task = get_task(args.task_name)
     train_sets = task.sample_train_sets(num_train=args.num_train, num_dev=args.num_dev, num_eval=args.num_eval, num_train_sets=args.num_train_sets, seed=args.train_set_seed)
@@ -526,7 +556,7 @@ def main():
                     dev_samples = None
 
                 # Training
-                framework.train(train_samples, dev_samples if dev_samples is not None else eval_samples)
+                framework.train(train_samples, dev_samples, eval_samples)
 
                 if not args.no_eval:
                     metrics = framework.evaluate([], eval_samples) # No in-context learning if there is training
@@ -545,6 +575,16 @@ def main():
                 print(metrics)
                 if args.local_rank <= 0:
                     write_metrics_to_file(metrics, "result/" +  result_file_tag(args) + f"-trainset{train_set_id}.json" if args.result_file is None else args.result_file)
+                    try:
+                        wandb.log(metrics)
+                    except:
+                        exit(0)
+            
+            if args.delete_ckpts_at_end:
+                # Delete checkpoints at the end
+                for f in os.listdir(args.output_dir):
+                    if f.endswith(".bin") or f.endswith(".safetensors") or f.endswith(".pt"):
+                        os.remove(os.path.join(args.output_dir, f))
 
     else:
         # For each eval sample, there is a training set. no training is allowed

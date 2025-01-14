@@ -188,6 +188,9 @@ from transformers.utils.quantization_config import QuantizationMethod
 
 from pruning_utils import (
     fast_random_mask_like,
+    fast_structured_random_mask_like,
+    random_mask_like,
+    structured_random_mask_like,
     estimate_pretrained_model_magnitude_pruning_threshold,
     compute_named_parameters_to_sparsity,
 )
@@ -201,6 +204,7 @@ from metrics import calculate_metric
 from adam_mini import Adam_mini
 from lion import Lion
 from cautious_lion import CLion
+from adabelief import AdaBelief
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -588,12 +592,17 @@ class OurTrainer(Trainer):
                 self.optimizer = CLion(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay, cautious_factor=args.cautious_factor)
             else:
                 self.optimizer = Lion(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
+        elif "AdaBelief" in args.trainer:
+            self.optimizer = AdaBelief(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
         else:
-            logger.info(f"args.trainer {args.trainer} is not a ZO trainer. Do not define separated optimizer.")
+            raise ValueError(f"args.trainer {args.trainer} is not a ZO trainer. Do not define separated optimizer.")
 
         if args.badam:
                 self.init_block_coordinate_descent(model=model, base_optimizer=self.optimizer, block_ordering=args.badam_ordering,
                                                     include_embedding=args.include_embedding, include_lm_head=args.include_lm_head, fine_blocks=args.fine_blocks)
+
+        if args.sparse_perturbation and args.block_sparsity:
+            self.num_attention_heads = model.config.num_attention_heads
         ############################################
 
         # Check if saved optimizer or scheduler states exist
@@ -922,6 +931,14 @@ class OurTrainer(Trainer):
                                 elif args.adam_mono:
                                     vmean = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg_sq'].clone().detach().cpu()
                                     wandb.log({f"vmean/{param_name}": vmean.mean().item()})
+                                elif isinstance(self.optimizer, AdaBelief):
+                                    v_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg_var'].clone().detach().cpu()
+                                    mean_v_t, std_v_t = v_t.mean().item(), v_t.std().item()
+                                    # import pdb; pdb.set_trace()
+
+                                    wandb.log({f"mean(v_t)/{param_name}": mean_v_t})
+                                    wandb.log({f"std(v_t)/{param_name}": std_v_t})
+                                    wandb.log({f"CoV(v_t)/{param_name}": std_v_t/mean_v_t})
                                 else:
                                     # m_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg'].clone().detach().cpu()
                                     v_t = self.optimizer.state[list(self.optimizer.state.keys())[param_map[0]]]['exp_avg_sq'].clone().detach().cpu()
@@ -1078,6 +1095,8 @@ class OurTrainer(Trainer):
         - scaling_factor: theta = theta + scaling_factor * z * eps
         """
         args = self.args
+        if args.sparse_perturbation and args.block_sparsity:
+            num_attention_heads = self.num_attention_heads
 
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
@@ -1137,8 +1156,12 @@ class OurTrainer(Trainer):
             if args.sparse_perturbation:
                 grad_sparsity = self.get_grad_sparsity_by_name(name)
                 if grad_sparsity is not None:
-                    z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                    if args.block_sparsity:
+                        z[fast_structured_random_mask_like(z, name, num_attention_heads, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                    else:
+                        z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
 
+                    
             param.data = param.data + scaling_factor * z * self.args.zo_eps
 
             # Sanity Check
@@ -1236,6 +1259,8 @@ class OurTrainer(Trainer):
         Update the parameters with the estimated gradients.
         """
         args = self.args
+        if args.sparse_perturbation and args.block_sparsity:
+            num_attention_heads = self.num_attention_heads
         # import pdb; pdb.set_trace()
 
         # Reset the random seed for sampling zs
@@ -1303,7 +1328,10 @@ class OurTrainer(Trainer):
             if args.sparse_perturbation:
                 grad_sparsity = self.get_grad_sparsity_by_name(name)
                 if grad_sparsity is not None:
-                    param.grad[fast_random_mask_like(param.grad, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                    if args.block_sparsity:
+                        param.grad[fast_structured_random_mask_like(param.grad, name, num_attention_heads, grad_sparsity, generator=self.sparse_grad_rng)] = 0    
+                    else:
+                        param.grad[fast_random_mask_like(param.grad, grad_sparsity, generator=self.sparse_grad_rng)] = 0
 
             # Gradient clipping
             if args.max_grad_norm is not None and args.max_grad_norm > 0:
@@ -2032,7 +2060,7 @@ class AdamWwithSparseUpdate(AdamW):
                 state["step"] += 1
 
                 # Mask for non-zero gradients
-                nonzero_mask = grad > 1e-8
+                nonzero_mask = grad.abs() > 1e-8
                 nonzero_grad = grad[nonzero_mask]
 
                 # Decay the first and second moment running average coefficient

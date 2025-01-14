@@ -2,15 +2,13 @@
 
 # export PT_HPU_LAZY_MODE=0
 # export PT_HPU_GPU_MIGRATION=1
-device=$1
-export CUDA_VISIBLE_DEVICES=$device
 
-trainer=$2
-task=$3
-shift 3
+trainer=$1
+task=$2
+shift 2
 
 # Default values
-MODEL="facebook/opt-1.3b"
+MODEL="facebook/opt-13b"
 BS=16
 EPS=1e-3
 TRAIN=1000
@@ -90,7 +88,7 @@ for BS in ${BS_LIST[@]}; do
             --num_train $TRAIN --num_dev $DEV --num_eval $EVAL \
             --logging_steps 1 \
             --max_steps $STEPS \
-            --trainer $Trainer --load_bfloat16 \
+            --trainer $Trainer --load_float16 \
             --learning_rate $LR --zo_eps $EPS \
             --per_device_train_batch_size $BS \
             --lr_scheduler_type "constant" \
@@ -98,11 +96,9 @@ for BS in ${BS_LIST[@]}; do
             --eval_steps $EVAL_STEPS \
             --train_as_classification \
             --max_grad_norm 0.0 \
-            --v_t_logging_steps 0\
             --early_stop\
             $EXTRA_ARGS \
             $TASK_ARGS \
             $@
-            # --save_strategy steps --save_total_limit 2 --save_steps $SAVE_STEPS --load_best_model_at_end --delete_ckpts_at_end
     done
 done

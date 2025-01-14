@@ -141,6 +141,7 @@ class OurArguments(TrainingArguments):
     gradient_sparsity: float = None
     sparse_gradient_group: str = "layer"
     sparse_gradient_resample_steps: int = 1
+    block_sparsity: bool = False # Use of block structured sparsity like Adam-mini
     sparse_update: bool = False # sparse update of m_t and v_t
 
     # 4. Low-rank random perturbation
@@ -564,7 +565,7 @@ def main():
     if args.h_informed_perturbation:
         run_name += "_h_informed"
     if args.sparse_perturbation:
-        run_name += f"_sparse_p{args.gradient_sparsity}_group_{args.sparse_gradient_group}_nu_{args.sparse_gradient_resample_steps}"
+        run_name += f"_sparse_p{args.gradient_sparsity}_group_{args.sparse_gradient_group}_nu_{args.sparse_gradient_resample_steps}_block_{args.block_sparsity}"
         if args.sparse_update:
             run_name += "_sparse_update"
     
@@ -607,7 +608,7 @@ def main():
         run_name += "_adam_mono"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
-    wandb.init(project="kfac-lozo-exp4", name=run_name, config=args)
+    wandb.init(project="kfac-lozo-exp5", name=run_name, config=args)
 
     set_seed(args.seed)
     task = get_task(args.task_name)
