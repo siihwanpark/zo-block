@@ -146,7 +146,8 @@ from pruning_utils import (
 )
 from utils import encode_prompt, Prediction
 from metrics import calculate_metric
-
+from tqdm import tqdm
+import re
 ################
 
 def _get_input_update_settings(model, lazy_mode: Optional[bool] = None) -> Tuple[bool, Dict]:
@@ -440,8 +441,7 @@ class OurGaudiTrainer(GaudiTrainer):
             raise ValueError(f"args.trainer {args.trainer} is not a ZO trainer. Do not define separated optimizer.")
 
         if args.bcd:
-                self.init_block_coordinate_descent(model=model, base_optimizer=self.optimizer, block_ordering=args.bcd_ordering,
-                                                    include_embedding=args.include_embedding, include_lm_head=args.include_lm_head)
+            self.init_block_coordinate_descent(model=model, base_optimizer=self.optimizer, block_ordering=args.bcd_ordering,include_embedding=args.include_embedding, include_lm_head=args.include_lm_head)
         ############################################
 
         # Check if saved optimizer or scheduler states exist
@@ -559,7 +559,7 @@ class OurGaudiTrainer(GaudiTrainer):
 
         ################## ZO added ###################
         if args.sparse_perturbation:
-            self.sparse_grad_rng = torch.Generator(device='cuda' if torch.cuda.is_available() else 'cpu')
+            self.sparse_grad_rng = torch.Generator(device='hpu')
             self.gradient_sparsity = None  # None, float, or dict
             
             if args.sparse_gradient_group == "layer" or args.gradient_sparsity is None:
@@ -955,8 +955,6 @@ class OurGaudiTrainer(GaudiTrainer):
             if sanity_check:
                 self.sanity_check = [{}, {}, {}]
 
-        loss = self.zo_forward(model, inputs)
-
         self.named_parameters_to_optim = []
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -983,7 +981,7 @@ class OurGaudiTrainer(GaudiTrainer):
         # Reset model back to its parameters at start of step
         self.zo_perturb_parameters(scaling_factor=1, sanity_check=sanity_check, order=2)
         
-        return loss
+        return loss1
 
     def zo_update(self, sanity_check=False):
         """

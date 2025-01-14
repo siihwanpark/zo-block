@@ -26,4 +26,4 @@ export PT_HPU_LAZY_MODE=0
 export PT_HPU_GPU_MIGRATION=1
 
 bash gaudi_scripts/run.sh MeZO-SGD SST2\
-    --learning_rate 1e-07  --max_steps 1000\
+    --learning_rate 1e-06  --max_steps 10000 --lozo_perturbation --rank_r 2 --lowrank_step_interval 100

@@ -432,7 +432,8 @@ class Framework:
         else:
             collator = DataCollatorForTokenClassification
 
-        gaudi_config = GaudiConfig.from_pretrained('habana/llama')
+        # gaudi_config = GaudiConfig.from_pretrained('habana/llama')
+        gaudi_config = GaudiConfig()
         # if not self.args.load_bfloat16:
            #  gaudi_config["use_torch_autocast"] = False
 
