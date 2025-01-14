@@ -143,6 +143,9 @@ from pruning_utils import (
     fast_random_mask_like,
     estimate_pretrained_model_magnitude_pruning_threshold,
     compute_named_parameters_to_sparsity,
+    estimate_pretrained_model_magnitude_pruning_layerwise_thresholds,
+    get_random_mask,
+    get_threshold_mask
 )
 from utils import encode_prompt, Prediction
 from metrics import calculate_metric
@@ -561,16 +564,13 @@ class OurGaudiTrainer(GaudiTrainer):
 
         ################## ZO added ###################
         if args.sparse_perturbation:
-            self.sparse_grad_rng = torch.Generator(device='hpu')
-            self.gradient_sparsity = None  # None, float, or dict
+            # For Gaudi, we cannot use RNG since `torch.Generator()` does not support HPU devices (CPU is extremely slow)
+            # Instead, we manually sample the sparse masks and hold them in the HPU memory
+            self.gradient_sparsity = args.gradient_sparsity
             
-            if args.sparse_gradient_group == "layer" or args.gradient_sparsity is None:
-                self.gradient_sparsity = args.gradient_sparsity
-                print(f"### layer-wise gradient sparsity = {self.gradient_sparsity}")
-            elif args.sparse_gradient_group == "global":
-                threshold = estimate_pretrained_model_magnitude_pruning_threshold(model, args.gradient_sparsity)
-                self.gradient_sparsity = compute_named_parameters_to_sparsity(model, threshold)
-                print(f"### global gradient sparsity, weight magnitude threshold = {threshold}")
+            # Precompute layerwise thresholds corresponding to the given target sparsity
+            if args.sparse_perturbation_type == "scale":
+                self.named_parameters_to_threshold = estimate_pretrained_model_magnitude_pruning_layerwise_thresholds(model, self.gradient_sparsity)
         ###############################################
 
         if args.eval_on_start:
@@ -672,9 +672,9 @@ class OurGaudiTrainer(GaudiTrainer):
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 ################# ZO added #################
-                # resample sparse_grad_random_seed
-                if args.sparse_perturbation and (self.state.global_step % args.sparse_gradient_resample_steps == 0):
-                    self.sparse_grad_random_seed = np.random.randint(1000000000)
+                # update sparse mask
+                if args.sparse_perturbation and args.sparse_perturbation_type == "random":
+                    self.sparse_mask = get_random_mask(model, self.gradient_sparsity)
 
                 # update active block for block coordinate descent
                 if args.bcd and (self.state.global_step % args.bcd_interval == 0):
@@ -881,20 +881,21 @@ class OurGaudiTrainer(GaudiTrainer):
         - scaling_factor: theta = theta + scaling_factor * z * eps
         """
         args = self.args
-
+        if args.sparse_perturbation and args.sparse_perturbation == "random":
+            name_to_mask = self.named_parameters_to_sparse_mask
+        
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
-
-        if args.sparse_perturbation:
-            self.sparse_grad_rng.manual_seed(self.sparse_grad_random_seed)
         
         for name, param in self.named_parameters_to_optim:
             z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             
             if args.sparse_perturbation:
-                grad_sparsity = self.get_grad_sparsity_by_name(name)
-                if grad_sparsity is not None:
-                    z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                if args.sparse_perturbation_type == "random":
+                    z = name_to_mask[name] * z
+                elif args.sparse_perturbation_type == "scale":
+                    mask = get_threshold_mask(name, param.data, self.named_parameters_to_threshold[name]).to(param.device)
+                    z = mask * z
 
             param.data = param.data + scaling_factor * z * self.args.zo_eps
 
@@ -961,8 +962,6 @@ class OurGaudiTrainer(GaudiTrainer):
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.named_parameters_to_optim.append((name, param))
-
-        perturb_parameters_func = self.zo_perturb_parameters
         
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
@@ -990,9 +989,8 @@ class OurGaudiTrainer(GaudiTrainer):
         Update the parameters with the estimated gradients.
         """
         args = self.args
-        if args.sparse_perturbation and args.block_sparsity:
-            num_attention_heads = self.num_attention_heads
-        # import pdb; pdb.set_trace()
+        if args.sparse_perturbation and args.sparse_perturbation_type == "random":
+            name_to_mask = self.named_parameters_to_sparse_mask
 
         # Reset the random seed for sampling zs
         torch.manual_seed(self.zo_random_seed)
@@ -1017,9 +1015,11 @@ class OurGaudiTrainer(GaudiTrainer):
 
             # sparse random perturbations
             if args.sparse_perturbation:
-                grad_sparsity = self.get_grad_sparsity_by_name(name)
-                if grad_sparsity is not None:
-                    param.grad[fast_random_mask_like(param.grad, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                if args.sparse_perturbation_type == "random":
+                    param.grad = name_to_mask[name] * param.grad
+                elif args.sparse_perturbation_type == "scale":
+                    mask = get_threshold_mask(name, param.data, self.named_parameters_to_threshold[name]).to(param.device)
+                    param.grad = mask * param.grad
 
             # Gradient clipping
             if args.max_grad_norm is not None and args.max_grad_norm > 0:

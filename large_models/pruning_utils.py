@@ -72,6 +72,34 @@ def compute_named_parameters_to_sparsity(
         named_parameters_to_sparsity[name] = param.abs().le(threshold).float().mean().item()
     return named_parameters_to_sparsity
 
+@torch.no_grad()
+def estimate_pretrained_model_magnitude_pruning_layerwise_thresholds(
+    model: PreTrainedModel,
+    sparsity: float,
+) -> Dict[str, float]:
+    named_parameters_to_threshold = {}
+    for name, param in model.named_parameters():
+        param_ = param.view(-1).abs().clone().detach().cpu()
+        sample_size = int(min(1e6, param_.numel()))
+        param_ = param_[:sample_size]
+        threshold = torch.quantile(param_.abs().float(), 1-sparsity).item()
+        named_parameters_to_threshold[name] = threshold
+    
+    return named_parameters_to_threshold
+
+@torch.no_grad()
+def get_threshold_mask(name, param, threshold):
+    return param.abs().le(threshold).float()
+
+@torch.no_grad()
+def get_random_mask(model, sparsity):
+    named_parameters_to_sparse_mask = {}
+    for name, param in model.named_parameters():
+        mask = (torch.normal(mean=0, std=1, size=param.size(), device=param.device, dtype=param.dtype) > sparsity).float()
+        named_parameters_to_sparse_mask[name] = mask
+    
+    return named_parameters_to_sparse_mask
+
 
 # Block structured sparsity
 @torch.no_grad()

@@ -193,6 +193,8 @@ from pruning_utils import (
     structured_random_mask_like,
     estimate_pretrained_model_magnitude_pruning_threshold,
     compute_named_parameters_to_sparsity,
+    estimate_pretrained_model_magnitude_pruning_layerwise_thresholds,
+    get_threshold_mask
 )
 
 from lr_scheduler import zo_lr_scheduler
@@ -695,15 +697,11 @@ class OurTrainer(Trainer):
         
         if args.sparse_perturbation:
             self.sparse_grad_rng = torch.Generator(device='cuda' if torch.cuda.is_available() else 'cpu')
-            self.gradient_sparsity = None  # None, float, or dict
+            self.gradient_sparsity = args.gradient_sparsity            
             
-            if args.sparse_gradient_group == "layer" or args.gradient_sparsity is None:
-                self.gradient_sparsity = args.gradient_sparsity
-                print(f"### layer-wise gradient sparsity = {self.gradient_sparsity}")
-            elif args.sparse_gradient_group == "global":
-                threshold = estimate_pretrained_model_magnitude_pruning_threshold(model, args.gradient_sparsity)
-                self.gradient_sparsity = compute_named_parameters_to_sparsity(model, threshold)
-                print(f"### global gradient sparsity, weight magnitude threshold = {threshold}")
+            # Precompute layerwise thresholds corresponding to the given target sparsity
+            if args.sparse_perturbation_type == "scale":
+                self.named_parameters_to_threshold = estimate_pretrained_model_magnitude_pruning_layerwise_thresholds(model, self.gradient_sparsity)
         ###############################################
 
         if args.eval_on_start:
@@ -797,7 +795,7 @@ class OurTrainer(Trainer):
                     
                     ################# ZO added #################
                     # resample sparse_grad_random_seed
-                    if args.sparse_perturbation and (self.state.global_step % args.sparse_gradient_resample_steps == 0):
+                    if args.sparse_perturbation and args.sparse_perturbation_type == "random":
                         self.sparse_grad_random_seed = np.random.randint(1000000000)
 
                     # update active block for block coordinate descent
@@ -1101,7 +1099,7 @@ class OurTrainer(Trainer):
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
 
-        if args.sparse_perturbation:
+        if args.sparse_perturbation and args.sparse_perturbation_type == "random":
             self.sparse_grad_rng.manual_seed(self.sparse_grad_random_seed)
         
         for name, param in self.named_parameters_to_optim:
@@ -1154,14 +1152,17 @@ class OurTrainer(Trainer):
                     pass
             
             if args.sparse_perturbation:
-                grad_sparsity = self.get_grad_sparsity_by_name(name)
-                if grad_sparsity is not None:
-                    if args.block_sparsity:
-                        z[fast_structured_random_mask_like(z, name, num_attention_heads, grad_sparsity, generator=self.sparse_grad_rng)] = 0
-                    else:
-                        z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                if args.sparse_perturbation_type == "random":
+                    grad_sparsity = self.get_grad_sparsity_by_name(name)
+                    if grad_sparsity is not None:
+                        if args.block_sparsity:
+                            z[fast_structured_random_mask_like(z, name, num_attention_heads, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                        else:
+                            z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                elif args.sparse_perturbation_type == "scale":
+                    mask = get_threshold_mask(name, param.data, self.named_parameters_to_threshold[name]).to(param.device)
+                    z = mask * z
 
-                    
             param.data = param.data + scaling_factor * z * self.args.zo_eps
 
             # Sanity Check
@@ -1224,8 +1225,6 @@ class OurTrainer(Trainer):
             if sanity_check:
                 self.sanity_check = [{}, {}, {}]
 
-        loss = self.zo_forward(model, inputs)
-
         self.named_parameters_to_optim = []
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -1252,7 +1251,7 @@ class OurTrainer(Trainer):
         # Reset model back to its parameters at start of step
         perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=2)
         
-        return loss
+        return loss1
 
     def zo_update(self, sanity_check=False):
         """
@@ -1324,14 +1323,17 @@ class OurTrainer(Trainer):
             else:
                 param.grad = self.projected_grad * z
 
-            # sparse random perturbations
             if args.sparse_perturbation:
-                grad_sparsity = self.get_grad_sparsity_by_name(name)
-                if grad_sparsity is not None:
-                    if args.block_sparsity:
-                        param.grad[fast_structured_random_mask_like(param.grad, name, num_attention_heads, grad_sparsity, generator=self.sparse_grad_rng)] = 0    
-                    else:
-                        param.grad[fast_random_mask_like(param.grad, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                if args.sparse_perturbation_type == "random":
+                    grad_sparsity = self.get_grad_sparsity_by_name(name)
+                    if grad_sparsity is not None:
+                        if args.block_sparsity:
+                            param.grad[fast_structured_random_mask_like(z, name, num_attention_heads, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                        else:
+                            param.grad[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+                elif args.sparse_perturbation_type == "scale":
+                    mask = get_threshold_mask(name, param.data, self.named_parameters_to_threshold[name]).to(param.device)
+                    param.grad = mask * param.grad
 
             # Gradient clipping
             if args.max_grad_norm is not None and args.max_grad_norm > 0:

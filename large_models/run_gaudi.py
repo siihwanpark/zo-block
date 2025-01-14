@@ -117,8 +117,8 @@ class OurArguments(GaudiTrainingArguments):
 
     # 3. Sparse random perturbation
     sparse_perturbation: bool = False # sparse perturbation
+    sparse_perturbation_type: str = "scale"
     gradient_sparsity: float = None
-    sparse_gradient_group: str = "layer"
     sparse_gradient_resample_steps: int = 1
 
     # 4. Low-rank random perturbation
@@ -512,7 +512,7 @@ def main():
     if 'SGD' in args.trainer:
         run_name += f"_m_{args.momentum}"
     if args.sparse_perturbation:
-        run_name += f"_sparse_p{args.gradient_sparsity}_group_{args.sparse_gradient_group}"
+        run_name += f"_sparse_p{args.gradient_sparsity}_{args.sparse_perturbation_type}"
     
     if args.lozo_perturbation:
         run_name += f"_lozo_r{args.rank_r}_nu{args.lowrank_step_interval}"

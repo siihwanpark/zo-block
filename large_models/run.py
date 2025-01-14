@@ -138,8 +138,8 @@ class OurArguments(TrainingArguments):
 
     # 3. Sparse random perturbation
     sparse_perturbation: bool = False # sparse perturbation
+    sparse_perturbation_type: str = "scale"
     gradient_sparsity: float = None
-    sparse_gradient_group: str = "layer"
     sparse_gradient_resample_steps: int = 1
     block_sparsity: bool = False # Use of block structured sparsity like Adam-mini
     sparse_update: bool = False # sparse update of m_t and v_t
@@ -565,7 +565,7 @@ def main():
     if args.h_informed_perturbation:
         run_name += "_h_informed"
     if args.sparse_perturbation:
-        run_name += f"_sparse_p{args.gradient_sparsity}_group_{args.sparse_gradient_group}_nu_{args.sparse_gradient_resample_steps}_block_{args.block_sparsity}"
+        run_name += f"_sparse_p{args.gradient_sparsity}_{args.sparse_perturbation_type}_nu_{args.sparse_gradient_resample_steps}_block_{args.block_sparsity}"
         if args.sparse_update:
             run_name += "_sparse_update"
     
