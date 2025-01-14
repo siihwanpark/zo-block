@@ -148,6 +148,8 @@ from utils import encode_prompt, Prediction
 from metrics import calculate_metric
 from tqdm import tqdm
 import re
+import torch.nn.functional as F
+from collections import defaultdict
 ################
 
 def _get_input_update_settings(model, lazy_mode: Optional[bool] = None) -> Tuple[bool, Dict]:
