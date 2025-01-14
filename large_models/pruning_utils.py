@@ -95,7 +95,7 @@ def get_threshold_mask(name, param, threshold):
 def get_random_mask(model, sparsity):
     named_parameters_to_sparse_mask = {}
     for name, param in model.named_parameters():
-        mask = (torch.normal(mean=0, std=1, size=param.size(), device=param.device, dtype=param.dtype) > sparsity).float()
+        mask = (torch.normal(mean=0, std=1, size=param.size(), device=param.device, dtype=param.dtype) > sparsity).bool()
         named_parameters_to_sparse_mask[name] = mask
     
     return named_parameters_to_sparse_mask

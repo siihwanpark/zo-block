@@ -674,7 +674,7 @@ class OurGaudiTrainer(GaudiTrainer):
                 ################# ZO added #################
                 # update sparse mask
                 if args.sparse_perturbation and args.sparse_perturbation_type == "random":
-                    self.sparse_mask = get_random_mask(model, self.gradient_sparsity)
+                    self.named_parameters_to_sparse_mask = get_random_mask(model, self.gradient_sparsity)
 
                 # update active block for block coordinate descent
                 if args.bcd and (self.state.global_step % args.bcd_interval == 0):
@@ -881,7 +881,7 @@ class OurGaudiTrainer(GaudiTrainer):
         - scaling_factor: theta = theta + scaling_factor * z * eps
         """
         args = self.args
-        if args.sparse_perturbation and args.sparse_perturbation == "random":
+        if args.sparse_perturbation and args.sparse_perturbation_type == "random":
             name_to_mask = self.named_parameters_to_sparse_mask
         
         # Set the random seed to ensure that we sample the same z for perturbation/update
