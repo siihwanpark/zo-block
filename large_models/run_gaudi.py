@@ -362,7 +362,7 @@ class Framework:
         return metrics
 
 
-    def train(self, train_samples, eval_samples):
+    def train(self, train_samples, dev_samples, eval_samples):
         """
         Training function
         """
@@ -420,7 +420,7 @@ class Framework:
 
         with count_time("Tokenizing training samples"):
             train_dataset = HFDataset(_convert(train_samples))
-            eval_dataset = HFDataset(_convert(eval_samples))
+            eval_dataset = HFDataset(_convert(dev_samples))
         
         if self.args.only_train_option and not self.args.non_diff:
             # If --only_train_option and not with a non-differentiable objective, we wrap the forward function
