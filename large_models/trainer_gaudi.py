@@ -932,11 +932,11 @@ class OurGaudiTrainer(GaudiTrainer):
             outputs = self.model.generate(
                 inputs["input_ids"], do_sample=args.sampling, temperature=args.temperature, 
                 num_beams=args.num_beams, top_p=args.top_p, top_k=args.top_k, max_new_tokens=min(args.max_new_tokens, args.max_length - inputs["input_ids"].size(1)), 
-                num_return_sequences=1, eos_token_id=[self.processing_class.encode(args.eos_token, add_special_tokens=False)[-1], self.processing_class.eos_token_id],
+                num_return_sequences=1, eos_token_id=[self.tokenizer.encode(args.eos_token, add_special_tokens=False)[-1], self.tokenizer.eos_token_id],
             )
             output_text = []
             for i in range(len(outputs)):
-                output_text.append(self.processing_class.decode(outputs[i][inputs["input_ids"].size(1):], skip_special_tokens=True).strip())
+                output_text.append(self.tokenizer.decode(outputs[i][inputs["input_ids"].size(1):], skip_special_tokens=True).strip())
             f1s = [f1(output_text[i], inputs['gold'][i]) for i in range(len(output_text))]
         
         return -torch.tensor(np.mean(f1s), dtype=torch.float32)
@@ -1288,10 +1288,10 @@ class OurGaudiTrainer(GaudiTrainer):
             outputs = self.model.generate(
                 input_ids, do_sample=args.sampling, temperature=args.temperature, 
                 num_beams=args.num_beams, top_p=args.top_p, top_k=args.top_k, max_new_tokens=min(args.max_new_tokens, args.max_length - input_ids.size(1)), 
-                num_return_sequences=1, eos_token_id=[self.processing_class.encode(args.eos_token, add_special_tokens=False)[-1], self.processing_class.eos_token_id],
+                num_return_sequences=1, eos_token_id=[self.tokenizer.encode(args.eos_token, add_special_tokens=False)[-1], self.tokenizer.eos_token_id],
             )
             # For generation, directly return the text output
-            output_text = self.processing_class.decode(outputs[0][input_ids.size(1):], skip_special_tokens=True).strip()
+            output_text = self.tokenizer.decode(outputs[0][input_ids.size(1):], skip_special_tokens=True).strip()
             return output_text
         else:
             with torch.inference_mode():
@@ -1318,14 +1318,14 @@ class OurGaudiTrainer(GaudiTrainer):
 
         # Encode (add prompt and tokenize) the sample; if multiple-choice/classification, encode all candidates (options)
         encoded_candidates, option_lens = encode_prompt(
-            self.task, self.task.get_template(), train_samples, eval_sample, self.processing_class, max_length=self.args.max_length, 
+            self.task, self.task.get_template(), train_samples, eval_sample, self.tokenizer, max_length=self.args.max_length, 
             generation=self.task.generation, max_new_tokens=self.args.max_new_tokens
         )
 
         # Calibration
         if self.args.sfc or self.args.icl_sfc:
             sfc_encoded_candidates, sfc_option_lens = encode_prompt(self.task, self.task.get_template(), 
-                train_samples, eval_sample, self.processing_class, max_length=self.args.max_length,
+                train_samples, eval_sample, self.tokenizer, max_length=self.args.max_length,
                 sfc=self.args.sfc, icl_sfc=self.args.icl_sfc, generation=self.task.generation, 
                 max_new_tokens=self.args.max_new_tokens
             )
@@ -1336,7 +1336,7 @@ class OurGaudiTrainer(GaudiTrainer):
             output_text = self.forward(encoded_candidates[0], generation=True)
             if verbose:
                 logger.info("=== Prompt ===")
-                logger.info(self.processing_class.decode(encoded_candidates[0]))
+                logger.info(self.tokenizer.decode(encoded_candidates[0]))
                 logger.info(f"Output: {output_text}") 
             return Prediction(correct_candidate=eval_sample.correct_candidate, predicted_candidate=output_text)
         else:
@@ -1346,17 +1346,17 @@ class OurGaudiTrainer(GaudiTrainer):
                 if verbose:
                     if candidate_id == 0:
                         logger.info("=== Candidate %d ===" % candidate_id)
-                        logger.info(self.processing_class.decode(encoded_candidate))
+                        logger.info(self.tokenizer.decode(encoded_candidate))
                     else:
                         logger.info("=== Candidate %d (without context)===" % candidate_id)
-                        logger.info(self.processing_class.decode(encoded_candidate).split(self.task.train_sep)[-1])
+                        logger.info(self.tokenizer.decode(encoded_candidate).split(self.task.train_sep)[-1])
                     logger.info(f"Log probabilities of the option tokens: {selected_log_probs}")
 
                 if self.args.sfc or self.args.icl_sfc:
                     sfc_selected_log_probs = self.forward(sfc_encoded_candidates[candidate_id], option_len=sfc_option_lens[candidate_id])
                     if verbose:
                         logger.info("=== Candidate %d (without context) SFC ===" % candidate_id)
-                        logger.info(self.processing_class.decode(sfc_encoded_candidates[candidate_id]).split(self.task.train_sep)[-1])
+                        logger.info(self.tokenizer.decode(sfc_encoded_candidates[candidate_id]).split(self.task.train_sep)[-1])
                         logger.info(f"Log probabilities of the option tokens: {sfc_selected_log_probs}")
 
                 outputs.append({"log_probs": selected_log_probs, "sfc_log_probs": sfc_selected_log_probs if self.args.sfc or self.args.icl_sfc else None})
