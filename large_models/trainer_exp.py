@@ -1498,8 +1498,6 @@ class OurTrainer(Trainer):
             if sanity_check:
                 self.sanity_check = [{}, {}, {}]
 
-        loss = self.zo_forward(model, inputs)
-
         self.named_parameters_to_optim = []
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -1526,7 +1524,7 @@ class OurTrainer(Trainer):
         # Reset model back to its parameters at start of step
         perturb_parameters_func(scaling_factor=1, sanity_check=sanity_check, order=2)
         
-        return loss
+        return loss1
 
     def lowrank_zo_update(self, sanity_check=False):
         """
