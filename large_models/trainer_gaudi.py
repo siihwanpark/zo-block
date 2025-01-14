@@ -1110,7 +1110,10 @@ class OurGaudiTrainer(GaudiTrainer):
         if args.save_perturbations:
             torch.manual_seed(self.zo_random_seed)
             for name, param in self.named_parameters_to_optim:
-                self.u[name] = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)               
+                if param.ndim >= 2:
+                    self.u[name] = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)               
+                else:
+                    self.u[name] = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
 
         # First function evaluation
         self.lowrank_zo_perturb_parameters(scaling_factor=1, sanity_check=sanity_check, order=0)
