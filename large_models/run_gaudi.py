@@ -433,6 +433,9 @@ class Framework:
             collator = DataCollatorForTokenClassification
 
         gaudi_config = GaudiConfig.from_pretrained('habana/llama')
+        # if not self.args.load_bfloat16:
+           #  gaudi_config["use_torch_autocast"] = False
+
         if "MeZO" in self.args.trainer:
             trainer = OurGaudiTrainer(
                 model=self.model, 

@@ -22,5 +22,8 @@
 # bash scripts/run.sh $device MeZO-Adam\
 #     --p_scaled_perturbation --learning_rate 5e-05 --eval_steps 5
 
+export PT_HPU_LAZY_MODE=0
+export PT_HPU_GPU_MIGRATION=1
+
 bash gaudi_scripts/run.sh MeZO-SGD SST2\
-    --learning_rate 1e-07  --max_steps 1000 --use_lazy_mode\
+    --learning_rate 1e-07  --max_steps 1000\

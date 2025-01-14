@@ -215,6 +215,8 @@ OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
+SANITY_CHECK = False
+
 class OurGaudiTrainer(GaudiTrainer):
     def _inner_training_loop(
         self,
@@ -738,10 +740,7 @@ class OurGaudiTrainer(GaudiTrainer):
 
                     if "MeZO" in args.trainer:
                         self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
-                        if self.args.h_informed_perturbation:
-                            # update is already done above
-                            grad_norm = 0.0
-                        elif self.args.lozo_perturbation or self.args.subzero_perturbation or self.args.kfac_perturbation:
+                        if self.args.lozo_perturbation:
                             grad_norm = self.lowrank_zo_update(sanity_check=SANITY_CHECK)
                         else:
                             grad_norm = self.zo_update(sanity_check=SANITY_CHECK)
