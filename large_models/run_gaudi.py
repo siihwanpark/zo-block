@@ -138,6 +138,8 @@ class OurArguments(GaudiTrainingArguments):
     patience: int = 10
     delete_ckpts_at_end: bool = True
 
+    save_perturbations: bool = False # Save perturbations; use more memory but faster
+
     # Gaudi-specific arguments
     use_habana: bool = True
     use_lazy_mode: bool = False

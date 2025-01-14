@@ -888,7 +888,10 @@ class OurGaudiTrainer(GaudiTrainer):
         torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
         
         for name, param in self.named_parameters_to_optim:
-            z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if not args.save_perturbations:
+                z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            else:
+                z = self.z[name]
             
             if args.sparse_perturbation:
                 if args.sparse_perturbation_type == "random":
@@ -957,6 +960,9 @@ class OurGaudiTrainer(GaudiTrainer):
             self.s_u = {}
             if sanity_check:
                 self.sanity_check = [{}, {}, {}]
+        
+        if args.save_perturbations:
+            self.z = {}
 
         self.named_parameters_to_optim = []
         for name, param in model.named_parameters():
@@ -965,6 +971,10 @@ class OurGaudiTrainer(GaudiTrainer):
         
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
+        if args.save_perturbations:
+            torch.manual_seed(self.zo_random_seed)
+            for name, param in self.named_parameters_to_optim:
+                self.z[name] = torch.normal(mean=0, std=1, size=param.size(), device=param.device, dtype=param.dtype)
 
         # First function evaluation
         self.zo_perturb_parameters(scaling_factor=1, sanity_check=sanity_check, order=0)
@@ -997,9 +1007,11 @@ class OurGaudiTrainer(GaudiTrainer):
 
         grad_norm_list = []
         for name, param in self.named_parameters_to_optim:
-            # Resample z
-            z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-
+            if not args.save_perturbations:
+                z = torch.normal(mean=0, std=1.0, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            else:
+                z = self.z[name]
+            
             # sanity check
             if sanity_check and name == SANITY_CHECK_MODULE_NAME:
                 pert_pert1 = torch.allclose(z, self.sanity_check[0][0][name], atol=1e-5)
@@ -1055,11 +1067,17 @@ class OurGaudiTrainer(GaudiTrainer):
                 else:
                     v = self.v[name]
                 
-                u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)               
+                if not args.save_perturbations:
+                    u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)               
+                else:
+                    u = self.u[name]
                 param.data = param.data + scaling_factor * u@v.t() * args.zo_eps
             
             else:
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                if not args.save_perturbations:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                else:
+                    z = self.u[name]
                 param.data = param.data + scaling_factor * z * args.zo_eps
 
     def lowrank_zo_step(self, model, inputs, sanity_check=False):
@@ -1076,6 +1094,9 @@ class OurGaudiTrainer(GaudiTrainer):
             if sanity_check:
                 self.sanity_check = [{}, {}, {}]
 
+        if args.save_perturbations:
+            self.u = {}
+
         loss = self.zo_forward(model, inputs)
 
         self.named_parameters_to_optim = []
@@ -1085,6 +1106,11 @@ class OurGaudiTrainer(GaudiTrainer):
         
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
+
+        if args.save_perturbations:
+            torch.manual_seed(self.zo_random_seed)
+            for name, param in self.named_parameters_to_optim:
+                self.u[name] = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)               
 
         # First function evaluation
         self.lowrank_zo_perturb_parameters(scaling_factor=1, sanity_check=sanity_check, order=0)
@@ -1125,11 +1151,17 @@ class OurGaudiTrainer(GaudiTrainer):
                 else:
                     v = self.v[name]
                 
-                u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                if not args.save_perturbations:
+                    u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)
+                else:
+                    u = self.u[name]
                 grad = self.projected_grad * u@v.t()
 
             else:
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                if not args.save_perturbations:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                else:
+                    z = self.u[name]
                 grad = self.projected_grad * z
 
             if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
