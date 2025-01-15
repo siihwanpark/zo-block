@@ -55,7 +55,7 @@ elif [ $device -eq 6 ]; then
     for task in SST2 RTE CB BoolQ WSC WIC Copa MultiRC ReCoRD SQuAD DROP;do
         for lr in 2e-06 5e-06 1e-05 2e-05 5e-05 1e-04;do
             bash gaudi_scripts/run.sh MeZO-SGD $task\
-                --learning_rate $lr --max_steps 2000 --momentum 0.0 --save_perturbations\
+                --learning_rate $lr --max_steps 5000 --momentum 0.0 --save_perturbations\
                 --bcd --bcd_order random --bcd_interval 100
         done
     done

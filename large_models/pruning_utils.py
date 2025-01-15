@@ -89,7 +89,8 @@ def estimate_pretrained_model_magnitude_pruning_layerwise_thresholds(
 
 @torch.no_grad()
 def get_threshold_mask(name, param, threshold):
-    return param.abs().le(threshold).float()
+
+    return param.abs().le(threshold).to(param.dtype)
 
 @torch.no_grad()
 def get_random_mask(model, sparsity):
