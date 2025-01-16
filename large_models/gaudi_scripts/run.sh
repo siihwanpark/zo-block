@@ -88,7 +88,7 @@ for BS in ${BS_LIST[@]}; do
             --num_train $TRAIN --num_dev $DEV --num_eval $EVAL \
             --logging_steps 1 \
             --max_steps $STEPS \
-            --trainer $Trainer --load_bfloat16 \
+            --trainer $Trainer --load_float16 \
             --learning_rate $LR --zo_eps $EPS \
             --per_device_train_batch_size $BS \
             --lr_scheduler_type "constant" \

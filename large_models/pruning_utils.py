@@ -91,7 +91,7 @@ def estimate_pretrained_model_magnitude_pruning_layerwise_thresholds(
 def get_threshold_mask(model, thresholds):
     named_parameters_to_sparse_mask = {}
     for name, param in model.named_parameters():
-        if not name in threshold.keys():
+        if not name in thresholds.keys():
             continue
         
         mask = param.abs().le(thresholds[name]).bool()

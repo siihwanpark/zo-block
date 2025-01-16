@@ -29,23 +29,23 @@ elif [ $device -eq 3 ]; then
 elif [ $device -eq 4 ]; then
     for task in SST2 CB WSC SQuAD DROP;do
         bash gaudi_scripts/run.sh MeZO-SGD $task\
-            --learning_rate 1e-05 --max_steps 20000 --momentum 0.0 --save_perturbations\
+            --learning_rate 5e-06 --max_steps 20000 --momentum 0.0 --save_perturbations\
             --bcd --bcd_ordering random --bcd_interval 100
     done
 
 elif [ $device -eq 5 ]; then
     for task in RTE BoolQ WIC Copa MultiRC ReCoRD;do
         bash gaudi_scripts/run.sh MeZO-SGD $task\
-            --learning_rate 1e-04 --max_steps 20000 --momentum 0.0 --save_perturbations\
+            --learning_rate 5e-05 --max_steps 20000 --momentum 0.0 --save_perturbations\
             --bcd --bcd_ordering random --bcd_interval 100
     done
 
 elif [ $device -eq 6 ]; then
     for task in SST2 RTE CB BoolQ WSC WIC Copa MultiRC ReCoRD SQuAD;do
         if [ $task == "RTE" ] || [ $task == "BoolQ" ] || [ $task == "WIC" ] || [ $task == "Copa" ] || [ $task == "MultiRC" ] || [ $task == "ReCoRD" ];then
-            lrs=(1e-07 1e-06)
+            lrs=(3e-07 1e-06 3e-06)
         else
-            lrs=(1e-06 1e-05)
+            lrs=(3e-07 1e-06 3e-06)
         fi
 
         for lr in ${lrs[@]};do

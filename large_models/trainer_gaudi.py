@@ -673,7 +673,7 @@ class OurGaudiTrainer(GaudiTrainer):
 
                 ################# ZO added #################
                 # update sparse mask
-                if args.sparse_perturbation
+                if args.sparse_perturbation:
                     if args.sparse_perturbation_type == "random":
                         self.named_parameters_to_sparse_mask = get_random_mask(model, self.gradient_sparsity)
                     elif args.sparse_perturbation_type == "scale":
