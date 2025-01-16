@@ -88,9 +88,16 @@ def estimate_pretrained_model_magnitude_pruning_layerwise_thresholds(
     return named_parameters_to_threshold
 
 @torch.no_grad()
-def get_threshold_mask(name, param, threshold):
+def get_threshold_mask(model, thresholds):
+    named_parameters_to_sparse_mask = {}
+    for name, param in model.named_parameters():
+        if not name in threshold.keys():
+            continue
+        
+        mask = param.abs().le(thresholds[name]).bool()
+        named_parameters_to_sparse_mask[name] = mask
 
-    return param.abs().le(threshold).to(param.dtype)
+    return named_parameters_to_sparse_mask
 
 @torch.no_grad()
 def get_random_mask(model, sparsity):
@@ -177,3 +184,7 @@ def fast_structured_random_mask_like(tensor, name, n_heads, nonzero_ratio, gener
     mask = mask.expand(-1, num_cols)
     
     return mask.bool()
+
+
+if __name__ == "__main__":
+    gradient_sparsity = 0.8

@@ -673,8 +673,11 @@ class OurGaudiTrainer(GaudiTrainer):
 
                 ################# ZO added #################
                 # update sparse mask
-                if args.sparse_perturbation and args.sparse_perturbation_type == "random":
-                    self.named_parameters_to_sparse_mask = get_random_mask(model, self.gradient_sparsity)
+                if args.sparse_perturbation
+                    if args.sparse_perturbation_type == "random":
+                        self.named_parameters_to_sparse_mask = get_random_mask(model, self.gradient_sparsity)
+                    elif args.sparse_perturbation_type == "scale":
+                        self.named_parameters_to_sparse_mask = get_threshold_mask(model, self.named_parameters_to_threshold)
 
                 # update active block for block coordinate descent
                 if args.bcd and (self.state.global_step % args.bcd_interval == 0):
@@ -881,7 +884,7 @@ class OurGaudiTrainer(GaudiTrainer):
         - scaling_factor: theta = theta + scaling_factor * z * eps
         """
         args = self.args
-        if args.sparse_perturbation and args.sparse_perturbation_type == "random":
+        if args.sparse_perturbation:
             name_to_mask = self.named_parameters_to_sparse_mask
         
         # Set the random seed to ensure that we sample the same z for perturbation/update
@@ -894,13 +897,9 @@ class OurGaudiTrainer(GaudiTrainer):
                 z = self.z[name]
             
             if args.sparse_perturbation:
-                if args.sparse_perturbation_type == "random":
-                    z = name_to_mask[name] * z
-                elif args.sparse_perturbation_type == "scale":
-                    mask = get_threshold_mask(name, param.data, self.named_parameters_to_threshold[name]).to(param.device)
-                    z = mask * z
+                z.mul_(name_to_mask[name])
 
-            param.data = param.data + scaling_factor * z * self.args.zo_eps
+            param.data.add_(scaling_factor * z * self.args.zo_eps)
 
             # Sanity Check
             if sanity_check and name == SANITY_CHECK_MODULE_NAME:
@@ -999,7 +998,7 @@ class OurGaudiTrainer(GaudiTrainer):
         Update the parameters with the estimated gradients.
         """
         args = self.args
-        if args.sparse_perturbation and args.sparse_perturbation_type == "random":
+        if args.sparse_perturbation:
             name_to_mask = self.named_parameters_to_sparse_mask
 
         # Reset the random seed for sampling zs
@@ -1027,11 +1026,7 @@ class OurGaudiTrainer(GaudiTrainer):
 
             # sparse random perturbations
             if args.sparse_perturbation:
-                if args.sparse_perturbation_type == "random":
-                    param.grad = name_to_mask[name] * param.grad
-                elif args.sparse_perturbation_type == "scale":
-                    mask = get_threshold_mask(name, param.data, self.named_parameters_to_threshold[name]).to(param.device)
-                    param.grad = mask * param.grad
+                param.grad.mul_(name_to_mask[name])
 
             # Gradient clipping
             if args.max_grad_norm is not None and args.max_grad_norm > 0:
@@ -1071,14 +1066,14 @@ class OurGaudiTrainer(GaudiTrainer):
                     u = torch.normal(mean=0, std=1, size=(param.data.size(0), args.rank_r), device=param.data.device, dtype=param.data.dtype)               
                 else:
                     u = self.u[name]
-                param.data = param.data + scaling_factor * u@v.t() * args.zo_eps
+                param.data.add_(scaling_factor * u@v.t() * args.zo_eps)
             
             else:
                 if not args.save_perturbations:
                     z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
                 else:
                     z = self.u[name]
-                param.data = param.data + scaling_factor * z * args.zo_eps
+                param.data.add_(scaling_factor * z * args.zo_eps)
 
     def lowrank_zo_step(self, model, inputs, sanity_check=False):
         """
