@@ -141,7 +141,6 @@ class Framework:
         Load HuggingFace models
         """
         with count_time("Loading model with FP%d" % (16 if self.args.load_float16 else 32)):
-            free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
             config = AutoConfig.from_pretrained(self.args.model_name)
             if self.args.untie_emb:
                 # Untie embeddings/LM head
