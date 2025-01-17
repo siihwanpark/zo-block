@@ -166,7 +166,7 @@ class Framework:
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_name,
                 config=config,
-                device_map=torch.device('cpu'),
+                device_map="auto",
                 torch_dtype=torch_dtype,
             )
             model.to(torch.device("hpu"))
