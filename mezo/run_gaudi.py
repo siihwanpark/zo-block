@@ -473,22 +473,22 @@ def main():
     model_name = args.model_name.split('/')[-1].strip()
     run_name = f"{model_name}_{args.trainer}"
     run_name += f"_ft_{args.task_name}_lr_{args.learning_rate:.0e}_bsz_{args.per_device_train_batch_size}_steps_{args.max_steps}"
-    if 'SGD' in args.trainer:
-        run_name += f"_m_{args.momentum}"
-    if args.sparse_perturbation:
-        run_name += f"_sparse_p{args.gradient_sparsity}_{args.sparse_perturbation_type}"
+    # if 'SGD' in args.trainer:
+    #     run_name += f"_m_{args.momentum}"
+    # if args.sparse_perturbation:
+    #     run_name += f"_sparse_p{args.gradient_sparsity}_{args.sparse_perturbation_type}"
     
-    if args.lozo_perturbation:
-        run_name += f"_lozo_r{args.rank_r}_nu{args.lowrank_step_interval}"
+    # if args.lozo_perturbation:
+    #     run_name += f"_lozo_r{args.rank_r}_nu{args.lowrank_step_interval}"
     
-    if args.bcd:
-        run_name += f"_bcd_{args.bcd_ordering}_K{args.bcd_interval}"
-        if args.state_flush:
-            run_name += "_state_flush"
-        if args.include_embedding:
-            run_name += "_embed"
-        if args.include_lm_head:
-            run_name += "_lm_head"
+    # if args.bcd:
+    #     run_name += f"_bcd_{args.bcd_ordering}_K{args.bcd_interval}"
+    #     if args.state_flush:
+    #         run_name += "_state_flush"
+    #     if args.include_embedding:
+    #         run_name += "_embed"
+    #     if args.include_lm_head:
+    #         run_name += "_lm_head"
 
     if args.max_grad_norm > 0:
         run_name += f"_max_grad_norm_{args.max_grad_norm}"
