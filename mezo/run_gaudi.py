@@ -30,11 +30,11 @@ import wandb
 from optimum.habana import GaudiTrainingArguments, GaudiConfig
 # from optimum.habana.transformers.models import GaudiOPTForCausalLM # this is not supported for optimum-habana==1.5.1
 
-from trainer_gaudi import OurGaudiTrainer
+from trainer_gaudi_old import OurGaudiTrainer
 from habana_frameworks.torch.hpu import random as hpu_random
-from optimum.habana.transformers.models import GaudiOPTForCausalLM
-from modeling_opt import gaudi_opt_attention_forward
-import optimum.habana.transformers
+# from optimum.habana.transformers.models import GaudiOPTForCausalLM
+# from modeling_opt import gaudi_opt_attention_forward
+# import optimum.habana.transformers
 #####################################
 
 @dataclass
