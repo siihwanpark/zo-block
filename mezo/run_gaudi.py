@@ -162,7 +162,7 @@ class Framework:
             
             if "opt" in self.args.model_name:
                 # Monkey Patching to fix the Gaudi forward malfunctioning
-                optimum.habana.transformers.models.opt.modeling_opt.OPTAttention.forward = gaudi_opt_attention_forward
+                optimum.habana.transformers.models.opt.modeling_opt.gaudi_opt_attention_forward = gaudi_opt_attention_forward
                 model = GaudiOPTForCausalLM.from_pretrained(
                     self.args.model_name,
                     config=config,
