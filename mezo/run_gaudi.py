@@ -27,13 +27,13 @@ import random
 ########## ZO / Gaudi-specific ###########
 import os
 import wandb
-import habana_frameworks.torch.core as htcore
 from optimum.habana import GaudiTrainingArguments, GaudiConfig
 # from optimum.habana.transformers.models import GaudiOPTForCausalLM # this is not supported for optimum-habana==1.5.1
 
 from trainer_gaudi import OurGaudiTrainer
 from habana_frameworks.torch.hpu import random as hpu_random
 from optimum.habana.transformers.models import GaudiOPTForCausalLM
+from modeling_opt import gaudi_opt_attention_forward
 #####################################
 
 @dataclass
@@ -160,16 +160,15 @@ class Framework:
                 torch_dtype = torch.bfloat16
             
             if "opt" in self.args.model_name:
+                # Monkey Patching to fix the Gaudi forward malfunctioning
+                optimum.habana.transformers.models.opt.modeling_opt.OPTAttention.forward = gaudi_opt_attention_forward
                 model = GaudiOPTForCausalLM.from_pretrained(
                     self.args.model_name,
                     config=config,
-                    device_map='auto',
                     torch_dtype=torch_dtype,
                 )
             else:
                 raise NotImplementedError(f"HPU not implemented for this model, {self.args.model_name}")
-            
-            model.to(torch.device("hpu"))
             model.eval()
 
         # Load tokenizer
