@@ -25,6 +25,7 @@ from trainer import OurTrainer
 import random
 
 ########## ZO / Gaudi-specific ###########
+import os
 import wandb
 import habana_frameworks.torch.core as htcore
 from optimum.habana import GaudiTrainingArguments, GaudiConfig
@@ -468,6 +469,9 @@ def result_file_tag(args):
 
 def main():
     args = parse_args()
+
+    if not args.use_lazy_mode:
+        os.environ["PT_HPU_LAZY_MODE"] = "0"
 
     model_name = args.model_name.split('/')[-1].strip()
     run_name = f"{model_name}_{args.trainer}"
