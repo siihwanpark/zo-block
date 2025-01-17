@@ -122,10 +122,7 @@ def gaudi_opt_attention_forward(
         attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device))
         attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-    from habana_frameworks.torch.hpex import hmp
-
-    with hmp.disable_casts():
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
     if layer_head_mask is not None:
         if layer_head_mask.size() != (self.num_heads,):
