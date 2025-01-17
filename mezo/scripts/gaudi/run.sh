@@ -5,6 +5,7 @@ export PT_HPU_GPU_MIGRATION=1
 
 TRAINER=$1
 TASK=$2
+shift 2
 
 MODEL=${MODEL:-facebook/opt-13b}
 MODEL_NAME=(${MODEL//\// })
