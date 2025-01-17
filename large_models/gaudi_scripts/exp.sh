@@ -49,7 +49,7 @@ if [ $device -eq 0 ]; then
     # done
 
     bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
         --seed 0
 
 elif [ $device -eq 1 ]; then
@@ -61,7 +61,7 @@ elif [ $device -eq 1 ]; then
     # done
 
     bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
         --seed 1
 
 elif [ $device -eq 2 ]; then
@@ -73,7 +73,7 @@ elif [ $device -eq 2 ]; then
     # done
 
     bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
         --seed 2
 
 elif [ $device -eq 3 ]; then
@@ -85,7 +85,7 @@ elif [ $device -eq 3 ]; then
     # done
 
     bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
         --seed 3
 
 elif [ $device -eq 4 ]; then
@@ -97,7 +97,7 @@ elif [ $device -eq 4 ]; then
     # done
 
     bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
         --seed 4
 
 elif [ $device -eq 5 ]; then
@@ -109,7 +109,7 @@ elif [ $device -eq 5 ]; then
     # done
 
     bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
         --seed 5
 
 elif [ $device -eq 6 ]; then
