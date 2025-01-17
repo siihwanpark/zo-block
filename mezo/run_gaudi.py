@@ -28,7 +28,7 @@ import random
 import wandb
 import habana_frameworks.torch.core as htcore
 from optimum.habana import GaudiTrainingArguments, GaudiConfig
-from optimum.habana.transformers.models import GaudiOPTForCausalLM
+# from optimum.habana.transformers.models import GaudiOPTForCausalLM # this is not supported for optimum-habana==1.5.1
 
 from trainer_gaudi import OurGaudiTrainer
 from habana_frameworks.torch.hpu import random as hpu_random
@@ -155,16 +155,21 @@ class Framework:
             elif self.args.load_bfloat16:
                 torch_dtype = torch.bfloat16
             
-            if "opt" in self.args.model_name:
-                model = GaudiOPTForCausalLM.from_pretrained(
-                    self.args.model_name if self.args.model_path is None else self.args.model_path,
-                    config=config,
-                    device_map='cpu',
-                    torch_dtype=torch_dtype,
-                )
-            else:
-                raise NotImplementedError(f"HPU not implemented for this model, {self.args.model_name}")
-            
+            # if "opt" in self.args.model_name:
+            #     model = GaudiOPTForCausalLM.from_pretrained(
+            #         self.args.model_name if self.args.model_path is None else self.args.model_path,
+            #         config=config,
+            #         device_map='cpu',
+            #         torch_dtype=torch_dtype,
+            #     )
+            # else:
+            #     raise NotImplementedError(f"HPU not implemented for this model, {self.args.model_name}")
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.model_name,
+                config=config,
+                device_map='cpu',
+                torch_dtype=torch_dtype,
+            )
             model.to(torch.device("hpu"))
             model.eval()
 
