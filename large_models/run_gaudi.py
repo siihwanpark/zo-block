@@ -532,7 +532,7 @@ def main():
     if args.max_grad_norm > 0:
         run_name += f"_max_grad_norm_{args.max_grad_norm}"
 
-    run_name += f"_seed_{args.train_set_seed}"
+    run_name += f"_seed_set{args.train_set_seed}_run{args.seed}"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
     wandb.init(project="mezo-gaudi", name=run_name, config=args)

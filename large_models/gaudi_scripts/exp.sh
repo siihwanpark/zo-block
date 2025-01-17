@@ -48,9 +48,8 @@ if [ $device -eq 0 ]; then
     #     done
     # done
 
-    bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
-        --seed 0
+    SEED=0 bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations
 
 elif [ $device -eq 1 ]; then
     # for task in RTE SQuAD;do
@@ -60,9 +59,8 @@ elif [ $device -eq 1 ]; then
     #     done
     # done
 
-    bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
-        --seed 1
+    SEED=1 bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations
 
 elif [ $device -eq 2 ]; then
     # for task in CB WIC;do
@@ -72,9 +70,8 @@ elif [ $device -eq 2 ]; then
     #     done
     # done
 
-    bash gaudi_scripts/run.sh MeZO-SGD SST2\
-        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
-        --seed 2
+    SEED=2 bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations
 
 elif [ $device -eq 3 ]; then
     # for task in BoolQ Copa;do
@@ -84,9 +81,9 @@ elif [ $device -eq 3 ]; then
     #     done
     # done
 
-    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+    SEED=0 bash gaudi_scripts/run.sh MeZO-SGD SST2\
         --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
-        --seed 3
+        --seed 17
 
 elif [ $device -eq 4 ]; then
     # for task in WSC ReCoRD;do
@@ -96,9 +93,9 @@ elif [ $device -eq 4 ]; then
     #     done
     # done
 
-    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+    SEED=0 bash gaudi_scripts/run.sh MeZO-SGD SST2\
         --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
-        --seed 4
+        --seed 11
 
 elif [ $device -eq 5 ]; then
     # for task in DROP;do
@@ -108,9 +105,9 @@ elif [ $device -eq 5 ]; then
     #     done
     # done
 
-    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+    SEED=0 bash gaudi_scripts/run.sh MeZO-SGD SST2\
         --learning_rate 1e-07 --max_steps 10000 --momentum 0.0 --save_perturbations\
-        --seed 5
+        --seed 31
 
 elif [ $device -eq 6 ]; then
     for task in SST2 RTE CB BoolQ WSC WIC Copa MultiRC ReCoRD SQuAD;do
