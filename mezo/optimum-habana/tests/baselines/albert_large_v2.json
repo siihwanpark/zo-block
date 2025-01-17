@@ -1,0 +1,28 @@
+{
+    "squad": {
+        "num_train_epochs": 2,
+        "eval_batch_size": 4,
+        "distribution": {
+            "single_card": {
+                "learning_rate": 6e-5,
+                "train_batch_size": 32,
+                "eval_f1": 91.9816,
+                "train_runtime": 3074.7632,
+                "train_samples_per_second": 59.785,
+                "extra_arguments": [
+                    "--max_seq_length 384"
+                ]
+            },
+            "multi_card": {
+                "learning_rate": 6e-5,
+                "train_batch_size": 32,
+                "eval_f1": 92.6013,
+                "train_runtime": 545.4712,
+                "train_samples_per_second": 424.945,
+                "extra_arguments": [
+                    "--max_seq_length 384"
+                ]
+            }
+        }
+    }
+}

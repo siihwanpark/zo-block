@@ -1,0 +1,30 @@
+{
+    "wikitext": {
+        "num_train_epochs": 3,
+        "eval_batch_size": 4,
+        "distribution": {
+            "single_card": {
+                "learning_rate": 5e-5,
+                "train_batch_size": 4,
+                "perplexity": 22.1727,
+                "train_runtime": 361.535,
+                "train_samples_per_second": 19.76,
+                "extra_arguments": [
+                    "--dataset_config_name wikitext-2-raw-v1",
+                    "--gradient_checkpointing"
+                ]
+            },
+            "multi_card": {
+                "learning_rate": 4e-4,
+                "train_batch_size": 4,
+                "perplexity": 22.421,
+                "train_runtime": 87.042,
+                "train_samples_per_second": 132.441,
+                "extra_arguments": [
+                    "--dataset_config_name wikitext-2-raw-v1",
+                    "--gradient_checkpointing"
+                ]
+            }
+        }
+    }
+}

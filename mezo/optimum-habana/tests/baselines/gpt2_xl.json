@@ -1,0 +1,20 @@
+{
+    "wikitext": {
+        "num_train_epochs": 2,
+        "eval_batch_size": 4,
+        "distribution": {
+            "deepspeed": {
+                "learning_rate": 4e-4,
+                "train_batch_size": 16,
+                "perplexity": 13.0631,
+                "train_runtime": 495.3144,
+                "train_samples_per_second": 17.435,
+                "extra_arguments": [
+                    "--dataset_config_name wikitext-2-raw-v1",
+                    "--gradient_checkpointing",
+                    "--deepspeed tests/configs/deepspeed_zero_2.json"
+                ]
+            }
+        }
+    }
+}

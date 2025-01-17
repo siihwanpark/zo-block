@@ -1,0 +1,36 @@
+{
+    "cifar10": {
+        "num_train_epochs": 5,
+        "eval_batch_size": 32,
+        "distribution": {
+            "single_card": {
+                "learning_rate": 3e-5,
+                "train_batch_size": 32,
+                "eval_accuracy": 0.9907,
+                "train_runtime": 713.4591,
+                "train_samples_per_second": 306.012,
+                "extra_arguments": [
+                    "--remove_unused_columns False",
+                    "--seed 1337",
+                    "--dataloader_num_workers 1",
+                    "--pipelining_fwd_bwd True",
+                    "--non_blocking_data_copy True"
+                ]
+            },
+            "multi_card": {
+                "learning_rate": 2e-4,
+                "train_batch_size": 64,
+                "eval_accuracy": 0.9893,
+                "train_runtime": 123.4608,
+                "train_samples_per_second": 2514.965,
+                "extra_arguments": [
+                    "--remove_unused_columns False",
+                    "--seed 1337",
+                    "--dataloader_num_workers 1",
+                    "--pipelining_fwd_bwd True",
+                    "--non_blocking_data_copy True"
+                ]
+            }
+        }
+    }
+}
