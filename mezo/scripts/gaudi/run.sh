@@ -1,7 +1,5 @@
 #!/bin/bash
-
-export PT_HPU_LAZY_MODE=0
-export PT_HPU_GPU_MIGRATION=1
+# export PT_HPU_GPU_MIGRATION=1
 
 TRAINER=$1
 TASK=$2
@@ -60,7 +58,7 @@ echo "TRAIN/EVAL STEPS: $STEPS/$EVAL_STEPS"
 echo "MODE: $MODE"
 echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 
-python run_gaudi.py \
+PT_HPU_LAZY_MODE=0 python run_gaudi.py \
     --model_name $MODEL \
     --task_name $TASK \
     --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 1 \
