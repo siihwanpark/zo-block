@@ -116,7 +116,6 @@ class OurArguments(GaudiTrainingArguments):
 
     use_habana: bool = True
     use_lazy_mode: bool = False
-    device: str = "hpu"
 
 
 def parse_args():

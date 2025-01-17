@@ -1,5 +1,7 @@
 #!/bin/bash
-# export PT_HPU_GPU_MIGRATION=1
+
+export PT_HPU_LAZY_MODE=0
+export PT_HPU_GPU_MIGRATION=1
 
 TRAINER=$1
 TASK=$2
