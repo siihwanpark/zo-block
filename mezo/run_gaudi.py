@@ -162,12 +162,14 @@ class Framework:
             
             if "opt" in self.args.model_name:
                 # Monkey Patching to fix the Gaudi forward malfunctioning
-                optimum.habana.transformers.models.opt.modeling_opt.gaudi_opt_attention_forward = gaudi_opt_attention_forward
-                model = GaudiOPTForCausalLM.from_pretrained(
+                # optimum.habana.transformers.models.opt.modeling_opt.gaudi_opt_attention_forward = gaudi_opt_attention_forward
+                # model = GaudiOPTForCausalLM.from_pretrained(
+                model = AutoModelForCausalLM.from_pretrained(
                     self.args.model_name,
                     config=config,
                     torch_dtype=torch_dtype,
                 )
+                
             else:
                 raise NotImplementedError(f"HPU not implemented for this model, {self.args.model_name}")
             model.eval()
