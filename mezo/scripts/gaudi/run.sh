@@ -40,7 +40,7 @@ case $TASK in
         DEV=100
         TASK_ARGS="--train_as_classification False"
         ;;
-    ReCoRD) 
+    ReCoRD)
         TASK_ARGS="--train_as_classification False"
         ;;
     DROP) 
@@ -69,7 +69,7 @@ python run_gaudi.py \
     --learning_rate $LR --zo_eps $EPS --per_device_train_batch_size $BS --lr_scheduler_type "constant" \
     --evaluation_strategy steps --save_strategy no \
     --eval_steps $EVAL_STEPS --save_steps $EVAL_STEPS \
-    --train_as_classification True\
+    --train_as_classification True \
     $EXTRA_ARGS \
     $TASK_ARGS \
     "$@"

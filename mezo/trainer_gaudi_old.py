@@ -22,7 +22,6 @@ import sys
 import tempfile
 import time
 import warnings
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -79,11 +78,9 @@ from transformers.utils import (
     is_safetensors_available,
 )
 
-from optimum.habana.distributed import all_reduce_gradients
 from optimum.utils import logging
 
 from optimum.habana.utils import (
-    HabanaProfile,
     get_hpu_memory_stats,
     set_seed,
     speed_metrics,
@@ -98,9 +95,6 @@ from optimum.habana.transformers.training_args import GaudiTrainingArguments
 from optimum.habana.transformers import GaudiTrainer
 import inspect
 from metrics import f1
-from utils import encode_prompt, Prediction
-from metrics import calculate_metric
-import torch.nn.functional as F
 ##############
 
 
@@ -216,15 +210,6 @@ class OurGaudiTrainer(GaudiTrainer):
 
                 torch.utils.checkpoint.checkpoint = lazy_mode_checkpointing
 
-            # HACK for gradient checkpointing with T5
-            # For T5, checkpointing is imported with `from torch.utils.checkpoint import checkpoint`: https://github.com/huggingface/transformers/blob/04ab5605fbb4ef207b10bf2772d88c53fc242e83/src/transformers/models/t5/modeling_t5.py#L27
-            # Whereas for other models we do `import torch.utils.checkpoint`
-            # So monkey patching at Torch's level does not work
-            if self.model.config.model_type == "t5":
-                import transformers.models.t5.modeling_t5 as modeling_t5
-
-                modeling_t5.checkpoint = torch.utils.checkpoint.checkpoint
-
         model = self._wrap_model(self.model_wrapped)
 
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
@@ -293,15 +278,6 @@ class OurGaudiTrainer(GaudiTrainer):
                     steps_trained_progress_bar = tqdm(total=steps_trained_in_current_epoch)
                     steps_trained_progress_bar.set_description("Skipping the first batches")
 
-        # In multi-worker training: broadcast model parameters from worker:0 to all the others.
-        # This must be done manually unless DistributedDataParallel is used.
-        if self.args.local_rank != -1 and self.args.distribution_strategy == "fast_ddp":
-            logger.debug(
-                f"Broadcasting the model parameters to assure that each of {self.args.world_size} workers start the training from the same point."
-            )
-            for param in model.parameters():
-                torch.distributed.broadcast(param.data, src=0)
-
         # Update the references
         self.callback_handler.model = self.model
         self.callback_handler.optimizer = self.optimizer
@@ -329,7 +305,11 @@ class OurGaudiTrainer(GaudiTrainer):
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
 
-        self._zero_model_grad(model)
+        # set_to_none is not implemented for some optimizers
+        try:
+            model.zero_grad(set_to_none=True)
+        except TypeError:
+            model.zero_grad()
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
@@ -348,14 +328,6 @@ class OurGaudiTrainer(GaudiTrainer):
                     # Otherwise we need to call the whooooole sampler cause there is some random operation added
                     # AT THE VERY END!
                     _ = list(train_dataloader.sampler)
-
-        if self.args.adjust_throughput:
-            self.log_evaluate_save_time = 0
-        else:
-            self.log_evaluate_save_time = None
-
-        hb_profiler = HabanaProfile(warmup=self.args.profiling_warmup_steps, active=self.args.profiling_steps)
-        hb_profiler.start()
 
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
@@ -380,7 +352,6 @@ class OurGaudiTrainer(GaudiTrainer):
                 self._load_rng_state(resume_from_checkpoint)
 
             step = -1
-
             for step, inputs in enumerate(epoch_iterator):
                 if (
                     args.throughput_warmup_steps > 0
@@ -403,14 +374,11 @@ class OurGaudiTrainer(GaudiTrainer):
 
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
-
                 if "MeZO" in args.trainer:
                     tr_loss_step = self.zo_step(model, inputs)
                 else:
-                    # Proceed with forward and backward passes.
                     if (
-                        args.distribution_strategy == "ddp"
-                        and ((step + 1) % args.gradient_accumulation_steps != 0)
+                        ((step + 1) % args.gradient_accumulation_steps != 0)
                         and args.local_rank != -1
                         and args._no_sync_in_gradient_accumulation
                     ):
@@ -419,17 +387,6 @@ class OurGaudiTrainer(GaudiTrainer):
                             tr_loss_step = self.training_step(model, inputs)
                     else:
                         tr_loss_step = self.training_step(model, inputs)
-
-                is_optimization_step = (step + 1) % args.gradient_accumulation_steps == 0 or (
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    steps_in_epoch <= args.gradient_accumulation_steps
-                    and (step + 1) == steps_in_epoch
-                )
-
-                if args.local_rank != -1 and args.distribution_strategy == "fast_ddp" and is_optimization_step:
-                    all_reduce_gradients(
-                        model, use_hpu_graph=True
-                    )  # use HPU graphs for gradient fusion regardless of args.use_hpu_graphs_for_training setting
 
                 if args.logging_nan_inf_filter and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step)):
                     # if loss is nan or inf simply add the average of previous logged losses
@@ -445,7 +402,11 @@ class OurGaudiTrainer(GaudiTrainer):
                 if self.deepspeed:
                     self.deepspeed.step()
 
-                if is_optimization_step:
+                if (step + 1) % args.gradient_accumulation_steps == 0 or (
+                    # last step in epoch but step is always smaller than gradient_accumulation_steps
+                    steps_in_epoch <= args.gradient_accumulation_steps
+                    and (step + 1) == steps_in_epoch
+                ):
                     if "MeZO" in args.trainer:
                         self.zo_update(model)
                     else:
@@ -463,11 +424,7 @@ class OurGaudiTrainer(GaudiTrainer):
                                 self.FusedNorm.clip_norm(model.parameters())
                             else:
                                 # Revert to normal clipping otherwise
-                                if (
-                                    args.use_habana
-                                    and (not (self.use_hpu_amp or self.use_cpu_amp))
-                                    and self.gaudi_config.use_habana_mixed_precision
-                                ):
+                                if args.use_habana and self.gaudi_config.use_habana_mixed_precision:
                                     with self.hmp.disable_casts():
                                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                                 else:
@@ -483,8 +440,7 @@ class OurGaudiTrainer(GaudiTrainer):
                         elif (
                             args.use_habana
                             and self.gaudi_config.use_habana_mixed_precision
-                            and (not self.gaudi_config.use_fused_adam)
-                            and (not (self.use_hpu_amp or self.use_cpu_amp))
+                            and not (self.gaudi_config.use_fused_adam)
                         ):
                             with self.hmp.disable_casts():
                                 self.optimizer.step()
@@ -494,7 +450,11 @@ class OurGaudiTrainer(GaudiTrainer):
                         if optimizer_was_run and not self.deepspeed:
                             self.lr_scheduler.step()
 
-                        self._zero_model_grad(model)
+                        # set_to_none is not implemented for some optimizers
+                        try:
+                            model.zero_grad(set_to_none=True)
+                        except TypeError:
+                            model.zero_grad()
 
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
@@ -506,7 +466,6 @@ class OurGaudiTrainer(GaudiTrainer):
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
-                hb_profiler.step()
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
             if step < 0:
@@ -522,8 +481,6 @@ class OurGaudiTrainer(GaudiTrainer):
 
             if self.control.should_training_stop:
                 break
-
-        hb_profiler.stop()
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -550,7 +507,6 @@ class OurGaudiTrainer(GaudiTrainer):
             num_samples=num_samples_for_speed_metrics,
             num_steps=num_steps_for_speed_metrics,
             start_time_after_warmup=start_time_after_warmup,
-            log_evaluate_save_time=self.log_evaluate_save_time,
         )
         self.store_flos()
         metrics["total_flos"] = self.state.total_flos
@@ -700,155 +656,3 @@ class OurGaudiTrainer(GaudiTrainer):
             # Labels may be named label or label_ids, the default data collator handles that.
             self._signature_columns += list(set(["label", "label_ids"] + self.label_names))
             self._signature_columns += ["gold"]
-
-    def forward(self, input_ids, option_len=None, generation=False):
-        """
-        Given input_ids and the length of the option, return the log-likelihood of each token in the option.
-        For generation tasks, return the generated text.
-        This function is only for inference
-        """
-        input_ids = torch.tensor([input_ids]).to(self.model.device)
-
-        if generation:
-            args = self.args
-            # Autoregressive generation
-            outputs = self.model.generate(
-                input_ids, do_sample=args.sampling, temperature=args.temperature, 
-                num_beams=args.num_beams, top_p=args.top_p, top_k=args.top_k, max_new_tokens=min(args.max_new_tokens, args.max_length - input_ids.size(1)), 
-                num_return_sequences=1, eos_token_id=[self.tokenizer.encode(args.eos_token, add_special_tokens=False)[-1], self.tokenizer.eos_token_id],
-            )
-            # For generation, directly return the text output
-            output_text = self.tokenizer.decode(outputs[0][input_ids.size(1):], skip_special_tokens=True).strip()
-            return output_text
-        else:
-            with torch.inference_mode():
-                self.model.eval()
-                logits = self.model(input_ids=input_ids).logits
-            labels = input_ids[0, 1:]
-            logits = logits[0, :-1] 
-            log_probs = F.log_softmax(logits, dim=-1)
-
-            selected_log_probs = log_probs[torch.arange(len(labels)).to(labels.device), labels]
-            selected_log_probs = selected_log_probs.cpu().detach()
-            # Only return the option (candidate) part
-            return selected_log_probs[-option_len:]
-
-    def one_step_pred(self, train_samples, eval_sample, verbose=False):
-        """
-        Return the prediction on the eval sample. In ICL, use train_samples as demonstrations
-        """
-        verbose = verbose or self.args.verbose
-        if verbose:
-            logger.info("========= Example =========")
-            logger.info(f"Candidate: {eval_sample.candidates}")
-            logger.info(f"Correct candidate: {eval_sample.correct_candidate}")
-
-        # Encode (add prompt and tokenize) the sample; if multiple-choice/classification, encode all candidates (options)
-        encoded_candidates, option_lens = encode_prompt(
-            self.task, self.task.get_template(), train_samples, eval_sample, self.tokenizer, max_length=self.args.max_length, 
-            generation=self.task.generation, max_new_tokens=self.args.max_new_tokens
-        )
-
-        # Calibration
-        if self.args.sfc or self.args.icl_sfc:
-            sfc_encoded_candidates, sfc_option_lens = encode_prompt(self.task, self.task.get_template(), 
-                train_samples, eval_sample, self.tokenizer, max_length=self.args.max_length,
-                sfc=self.args.sfc, icl_sfc=self.args.icl_sfc, generation=self.task.generation, 
-                max_new_tokens=self.args.max_new_tokens
-            )
-
-        outputs = []
-        if self.task.generation:
-            # For generation tasks, return the autoregressively-generated text
-            output_text = self.forward(encoded_candidates[0], generation=True)
-            if verbose:
-                logger.info("=== Prompt ===")
-                logger.info(self.tokenizer.decode(encoded_candidates[0]))
-                logger.info(f"Output: {output_text}") 
-            return Prediction(correct_candidate=eval_sample.correct_candidate, predicted_candidate=output_text)
-        else:
-            # For classification/multiple-choice, calculate the probabilities of all candidates
-            for candidate_id, encoded_candidate in enumerate(encoded_candidates):
-                selected_log_probs = self.forward(encoded_candidate, option_len=option_lens[candidate_id])
-                if verbose:
-                    if candidate_id == 0:
-                        logger.info("=== Candidate %d ===" % candidate_id)
-                        logger.info(self.tokenizer.decode(encoded_candidate))
-                    else:
-                        logger.info("=== Candidate %d (without context)===" % candidate_id)
-                        logger.info(self.tokenizer.decode(encoded_candidate).split(self.task.train_sep)[-1])
-                    logger.info(f"Log probabilities of the option tokens: {selected_log_probs}")
-
-                if self.args.sfc or self.args.icl_sfc:
-                    sfc_selected_log_probs = self.forward(sfc_encoded_candidates[candidate_id], option_len=sfc_option_lens[candidate_id])
-                    if verbose:
-                        logger.info("=== Candidate %d (without context) SFC ===" % candidate_id)
-                        logger.info(self.tokenizer.decode(sfc_encoded_candidates[candidate_id]).split(self.task.train_sep)[-1])
-                        logger.info(f"Log probabilities of the option tokens: {sfc_selected_log_probs}")
-
-                outputs.append({"log_probs": selected_log_probs, "sfc_log_probs": sfc_selected_log_probs if self.args.sfc or self.args.icl_sfc else None})
-
-            if self.args.sfc or self.args.icl_sfc:
-                # Calibrated probabilities (surface form competition; https://arxiv.org/pdf/2104.08315.pdf)
-                # log p(candidate | input) = log p_lm(candidate | input) - log p_lm(candidate | sfc prompt)
-                scores = [x['log_probs'].sum().item() - x['sfc_log_probs'].sum().item() for x in outputs]
-            else:
-                # (Default) length-normalized log probabilities
-                # log p(candidate | input) = log p_lm(candidate | input) / |candidate #tokens|
-                scores = [x['log_probs'].mean().item() for x in outputs]
-
-            if verbose:
-                logger.info(f"Prediction scores: {scores}")
-
-            if isinstance(eval_sample.correct_candidate, list):
-                # For some datasets there are multiple correct answers
-                correct_candidate_id = [eval_sample.candidates.index(c) for c in eval_sample.correct_candidate]
-            else:
-                correct_candidate_id = eval_sample.candidates.index(eval_sample.correct_candidate)
-
-            return Prediction(correct_candidate=correct_candidate_id, predicted_candidate=int(np.argmax(scores)))
-    
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
-
-        metrics = {}
-        # Prediction loop
-        predictions = []
-        for eval_id, eval_sample in enumerate(tqdm(self.eval_samples)):
-            predictions.append(
-                self.one_step_pred([], eval_sample, verbose=(eval_id < 3))
-            )
-
-        # Calculate metrics
-        metric_name = getattr(self.task, "metric_name", "accuracy")
-        metrics[f"eval_{metric_name}"]=calculate_metric(predictions, metric_name)
-
-        # Prediction loop
-        predictions = []
-        for dev_id, dev_sample in enumerate(tqdm(self.dev_samples)):
-            predictions.append(
-                self.one_step_pred([], dev_sample, verbose=(dev_id < 3))
-            )
-
-        # Calculate metrics 
-        metrics[f"dev_{metric_name}"]=calculate_metric(predictions, metric_name)
-        logger.info(metrics)
-        self.log(metrics)
-
-        if hasattr(self, 'best_eval_metrics'):
-            if self.best_eval_metrics[f"best_eval_{metric_name}"] < metrics[f"eval_{metric_name}"]:
-                self.best_eval_metrics[f"best_eval_{metric_name}"] = metrics[f"eval_{metric_name}"]
-            if self.best_eval_metrics[f"best_dev_{metric_name}"] < metrics[f"dev_{metric_name}"]:
-                if self.args.early_stop:
-                    self.patience = 0
-                self.best_eval_metrics[f"best_dev_{metric_name}"] = metrics[f"dev_{metric_name}"]
-            else:
-                if self.args.early_stop:
-                    self.patience += 1
-                    if self.patience >= self.args.patience:
-                        self.control.should_training_stop = True
-        else:
-            if self.args.early_stop:
-                self.patience = 0
-            self.best_eval_metrics = {f"best_eval_{metric_name}": metrics[f"eval_{metric_name}"], f"best_dev_{metric_name}": metrics[f"dev_{metric_name}"]}
-        self.log(self.best_eval_metrics)

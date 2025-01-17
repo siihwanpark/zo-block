@@ -152,7 +152,9 @@ from transformers.utils import (
     logging,
 )
 from transformers.utils.generic import ContextManagers
-
+from utils import encode_prompt, Prediction
+from metrics import calculate_metric
+import torch.nn.functional as F
 
 _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
 
@@ -809,7 +811,157 @@ class OurTrainer(Trainer):
 
 
     ############## Misc overload functions ##############
+    def forward(self, input_ids, option_len=None, generation=False):
+        """
+        Given input_ids and the length of the option, return the log-likelihood of each token in the option.
+        For generation tasks, return the generated text.
+        This function is only for inference
+        """
+        input_ids = torch.tensor([input_ids]).to(self.model.device)
 
+        if generation:
+            args = self.args
+            # Autoregressive generation
+            outputs = self.model.generate(
+                input_ids, do_sample=args.sampling, temperature=args.temperature, 
+                num_beams=args.num_beams, top_p=args.top_p, top_k=args.top_k, max_new_tokens=min(args.max_new_tokens, args.max_length - input_ids.size(1)), 
+                num_return_sequences=1, eos_token_id=[self.tokenizer.encode(args.eos_token, add_special_tokens=False)[-1], self.tokenizer.eos_token_id],
+            )
+            # For generation, directly return the text output
+            output_text = self.tokenizer.decode(outputs[0][input_ids.size(1):], skip_special_tokens=True).strip()
+            return output_text
+        else:
+            with torch.inference_mode():
+                self.model.eval()
+                logits = self.model(input_ids=input_ids).logits
+            labels = input_ids[0, 1:]
+            logits = logits[0, :-1] 
+            log_probs = F.log_softmax(logits, dim=-1)
+
+            selected_log_probs = log_probs[torch.arange(len(labels)).to(labels.device), labels]
+            selected_log_probs = selected_log_probs.cpu().detach()
+            # Only return the option (candidate) part
+            return selected_log_probs[-option_len:]
+
+    def one_step_pred(self, train_samples, eval_sample, verbose=False):
+        """
+        Return the prediction on the eval sample. In ICL, use train_samples as demonstrations
+        """
+        verbose = verbose or self.args.verbose
+        if verbose:
+            logger.info("========= Example =========")
+            logger.info(f"Candidate: {eval_sample.candidates}")
+            logger.info(f"Correct candidate: {eval_sample.correct_candidate}")
+
+        # Encode (add prompt and tokenize) the sample; if multiple-choice/classification, encode all candidates (options)
+        encoded_candidates, option_lens = encode_prompt(
+            self.task, self.task.get_template(), train_samples, eval_sample, self.tokenizer, max_length=self.args.max_length, 
+            generation=self.task.generation, max_new_tokens=self.args.max_new_tokens
+        )
+
+        # Calibration
+        if self.args.sfc or self.args.icl_sfc:
+            sfc_encoded_candidates, sfc_option_lens = encode_prompt(self.task, self.task.get_template(), 
+                train_samples, eval_sample, self.tokenizer, max_length=self.args.max_length,
+                sfc=self.args.sfc, icl_sfc=self.args.icl_sfc, generation=self.task.generation, 
+                max_new_tokens=self.args.max_new_tokens
+            )
+
+        outputs = []
+        if self.task.generation:
+            # For generation tasks, return the autoregressively-generated text
+            output_text = self.forward(encoded_candidates[0], generation=True)
+            if verbose:
+                logger.info("=== Prompt ===")
+                logger.info(self.tokenizer.decode(encoded_candidates[0]))
+                logger.info(f"Output: {output_text}") 
+            return Prediction(correct_candidate=eval_sample.correct_candidate, predicted_candidate=output_text)
+        else:
+            # For classification/multiple-choice, calculate the probabilities of all candidates
+            for candidate_id, encoded_candidate in enumerate(encoded_candidates):
+                selected_log_probs = self.forward(encoded_candidate, option_len=option_lens[candidate_id])
+                if verbose:
+                    if candidate_id == 0:
+                        logger.info("=== Candidate %d ===" % candidate_id)
+                        logger.info(self.tokenizer.decode(encoded_candidate))
+                    else:
+                        logger.info("=== Candidate %d (without context)===" % candidate_id)
+                        logger.info(self.tokenizer.decode(encoded_candidate).split(self.task.train_sep)[-1])
+                    logger.info(f"Log probabilities of the option tokens: {selected_log_probs}")
+
+                if self.args.sfc or self.args.icl_sfc:
+                    sfc_selected_log_probs = self.forward(sfc_encoded_candidates[candidate_id], option_len=sfc_option_lens[candidate_id])
+                    if verbose:
+                        logger.info("=== Candidate %d (without context) SFC ===" % candidate_id)
+                        logger.info(self.tokenizer.decode(sfc_encoded_candidates[candidate_id]).split(self.task.train_sep)[-1])
+                        logger.info(f"Log probabilities of the option tokens: {sfc_selected_log_probs}")
+
+                outputs.append({"log_probs": selected_log_probs, "sfc_log_probs": sfc_selected_log_probs if self.args.sfc or self.args.icl_sfc else None})
+
+            if self.args.sfc or self.args.icl_sfc:
+                # Calibrated probabilities (surface form competition; https://arxiv.org/pdf/2104.08315.pdf)
+                # log p(candidate | input) = log p_lm(candidate | input) - log p_lm(candidate | sfc prompt)
+                scores = [x['log_probs'].sum().item() - x['sfc_log_probs'].sum().item() for x in outputs]
+            else:
+                # (Default) length-normalized log probabilities
+                # log p(candidate | input) = log p_lm(candidate | input) / |candidate #tokens|
+                scores = [x['log_probs'].mean().item() for x in outputs]
+
+            if verbose:
+                logger.info(f"Prediction scores: {scores}")
+
+            if isinstance(eval_sample.correct_candidate, list):
+                # For some datasets there are multiple correct answers
+                correct_candidate_id = [eval_sample.candidates.index(c) for c in eval_sample.correct_candidate]
+            else:
+                correct_candidate_id = eval_sample.candidates.index(eval_sample.correct_candidate)
+
+            return Prediction(correct_candidate=correct_candidate_id, predicted_candidate=int(np.argmax(scores)))
+    
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+
+        metrics = {}
+        # Prediction loop
+        predictions = []
+        for eval_id, eval_sample in enumerate(tqdm(self.eval_samples)):
+            predictions.append(
+                self.one_step_pred([], eval_sample, verbose=(eval_id < 3))
+            )
+
+        # Calculate metrics
+        metric_name = getattr(self.task, "metric_name", "accuracy")
+        metrics[f"eval_{metric_name}"]=calculate_metric(predictions, metric_name)
+
+        # Prediction loop
+        predictions = []
+        for dev_id, dev_sample in enumerate(tqdm(self.dev_samples)):
+            predictions.append(
+                self.one_step_pred([], dev_sample, verbose=(dev_id < 3))
+            )
+
+        # Calculate metrics 
+        metrics[f"dev_{metric_name}"]=calculate_metric(predictions, metric_name)
+        logger.info(metrics)
+        self.log(metrics)
+
+        if hasattr(self, 'best_eval_metrics'):
+            if self.best_eval_metrics[f"best_eval_{metric_name}"] < metrics[f"eval_{metric_name}"]:
+                self.best_eval_metrics[f"best_eval_{metric_name}"] = metrics[f"eval_{metric_name}"]
+            if self.best_eval_metrics[f"best_dev_{metric_name}"] < metrics[f"dev_{metric_name}"]:
+                if self.args.early_stop:
+                    self.patience = 0
+                self.best_eval_metrics[f"best_dev_{metric_name}"] = metrics[f"dev_{metric_name}"]
+            else:
+                if self.args.early_stop:
+                    self.patience += 1
+                    if self.patience >= self.args.patience:
+                        self.control.should_training_stop = True
+        else:
+            if self.args.early_stop:
+                self.patience = 0
+            self.best_eval_metrics = {f"best_eval_{metric_name}": metrics[f"eval_{metric_name}"], f"best_dev_{metric_name}": metrics[f"dev_{metric_name}"]}
+        self.log(self.best_eval_metrics)
 
     def _set_signature_columns_if_needed(self):
         """

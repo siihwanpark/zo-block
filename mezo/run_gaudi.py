@@ -33,6 +33,7 @@ from optimum.habana import GaudiTrainingArguments, GaudiConfig
 
 from trainer_gaudi import OurGaudiTrainer
 from habana_frameworks.torch.hpu import random as hpu_random
+from optimum.habana.transformers.models import GaudiOPTForCausalLM
 #####################################
 
 @dataclass
@@ -117,6 +118,9 @@ class OurArguments(GaudiTrainingArguments):
     use_habana: bool = True
     use_lazy_mode: bool = False
 
+    early_stop: bool = False
+    patience: int = 10
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -155,21 +159,16 @@ class Framework:
             elif self.args.load_bfloat16:
                 torch_dtype = torch.bfloat16
             
-            # if "opt" in self.args.model_name:
-            #     model = GaudiOPTForCausalLM.from_pretrained(
-            #         self.args.model_name if self.args.model_path is None else self.args.model_path,
-            #         config=config,
-            #         device_map='cpu',
-            #         torch_dtype=torch_dtype,
-            #     )
-            # else:
-            #     raise NotImplementedError(f"HPU not implemented for this model, {self.args.model_name}")
-            model = AutoModelForCausalLM.from_pretrained(
-                self.args.model_name,
-                config=config,
-                device_map="auto",
-                torch_dtype=torch_dtype,
-            )
+            if "opt" in self.args.model_name:
+                model = GaudiOPTForCausalLM.from_pretrained(
+                    self.args.model_name if self.args.model_path is None else self.args.model_path,
+                    config=config,
+                    device_map='cpu',
+                    torch_dtype=torch_dtype,
+                )
+            else:
+                raise NotImplementedError(f"HPU not implemented for this model, {self.args.model_name}")
+            
             model.to(torch.device("hpu"))
             model.eval()
 
@@ -338,7 +337,7 @@ class Framework:
         return metrics
 
 
-    def train(self, train_samples, eval_samples):
+    def train(self, train_samples, dev_samples, eval_samples):
         """
         Training function
         """
@@ -396,7 +395,7 @@ class Framework:
 
         with count_time("Tokenizing training samples"):
             train_dataset = HFDataset(_convert(train_samples))
-            eval_dataset = HFDataset(_convert(eval_samples))
+            eval_dataset = HFDataset(_convert(dev_samples))
         
         if self.args.only_train_option and not self.args.non_diff:
             # If --only_train_option and not with a non-differentiable objective, we wrap the forward function
@@ -418,6 +417,13 @@ class Framework:
             data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
             gaudi_config=gaudi_config,
         )
+
+        ############### added for inter-training evaluation ################
+        trainer.eval_samples = eval_samples
+        trainer.dev_samples = dev_samples
+        trainer.task = self.task
+        ####################################################################
+
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
 
@@ -493,11 +499,11 @@ def main():
     #     if args.include_lm_head:
     #         run_name += "_lm_head"
 
-    if args.max_grad_norm > 0:
-        run_name += f"_max_grad_norm_{args.max_grad_norm}"
+    # if args.max_grad_norm > 0:
+    #     run_name += f"_max_grad_norm_{args.max_grad_norm}"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
-    wandb.init(project="mezo-gaudi", name=run_name, config=args)
+    wandb.init(project="mezo-original-gaudi", name=run_name, config=args)
 
     set_seed(args.seed)
     task = get_task(args.task_name)
@@ -526,12 +532,12 @@ def main():
                     dev_samples = None
 
                 # Training
-                framework.train(train_samples, dev_samples if dev_samples is not None else eval_samples)
+                framework.train(train_samples, dev_samples, eval_samples)
 
                 if not args.no_eval:
                     metrics = framework.evaluate([], eval_samples) # No in-context learning if there is training
                     if dev_samples is not None:
-                        dev_metrics = framework.evaluate([], dev_samples) 
+                        dev_metrics = framework.evaluate([], dev_samples)
                         for m in dev_metrics:
                             metrics["dev_" + m] = dev_metrics[m]
             else:
