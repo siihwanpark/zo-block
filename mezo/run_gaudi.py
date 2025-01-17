@@ -163,7 +163,7 @@ class Framework:
                 model = GaudiOPTForCausalLM.from_pretrained(
                     self.args.model_name,
                     config=config,
-                    device_map='cpu',
+                    device_map='auto',
                     torch_dtype=torch_dtype,
                 )
             else:
