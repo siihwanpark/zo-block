@@ -34,6 +34,7 @@ from trainer_gaudi import OurGaudiTrainer
 from habana_frameworks.torch.hpu import random as hpu_random
 from optimum.habana.transformers.models import GaudiOPTForCausalLM
 from modeling_opt import gaudi_opt_attention_forward
+import optimum.habana.transformers
 #####################################
 
 @dataclass
