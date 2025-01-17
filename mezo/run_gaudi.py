@@ -161,7 +161,7 @@ class Framework:
             
             if "opt" in self.args.model_name:
                 model = GaudiOPTForCausalLM.from_pretrained(
-                    self.args.model_name if self.args.model_path is None else self.args.model_path,
+                    self.args.model_name,
                     config=config,
                     device_map='cpu',
                     torch_dtype=torch_dtype,
