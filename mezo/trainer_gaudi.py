@@ -86,10 +86,10 @@ from optimum.habana.utils import (
     speed_metrics,
     to_device_dtype,
 )
-from optimum.habaha.transformers.deepspeed import deepspeed_init
-from optimum.habaha.transformers.gaudi_configuration import GAUDI_CONFIG_NAME, GaudiConfig
-from optimum.habaha.transformers.trainer_utils import convert_into_dtypes, get_dtype
-from optimum.habaha.transformers.training_args import GaudiTrainingArguments
+from optimum.habana.transformers.deepspeed import deepspeed_init
+from optimum.habana.transformers.gaudi_configuration import GAUDI_CONFIG_NAME, GaudiConfig
+from optimum.habana.transformers.trainer_utils import convert_into_dtypes, get_dtype
+from optimum.habana.transformers.training_args import GaudiTrainingArguments
 
 ## ZO Added ##
 from optimum.habana.transformers import GaudiTrainer
