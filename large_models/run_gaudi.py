@@ -26,6 +26,7 @@ import random
 import wandb
 ########## Gaudi-specific ###########
 import habana_frameworks.torch.core as htcore
+from habana_frameworks.torch.hpu import random as hpu_random
 from optimum.habana import GaudiTrainingArguments, GaudiConfig
 from optimum.habana.transformers.models import GaudiOPTForCausalLM
 
@@ -156,7 +157,7 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    hpu_random.manual_seed_all(seed)
 
 class Framework:
     def __init__(self, args, task):
@@ -530,6 +531,8 @@ def main():
 
     if args.max_grad_norm > 0:
         run_name += f"_max_grad_norm_{args.max_grad_norm}"
+
+    run_name += f"_seed_{args.train_set_seed}"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
     wandb.init(project="mezo-gaudi", name=run_name, config=args)

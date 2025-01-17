@@ -41,52 +41,76 @@ device=$1
 #     done
 
 if [ $device -eq 0 ]; then
-    for task in SST2 MultiRC;do
-        for lr in 1e-07 1e-06;do
-            bash gaudi_scripts/run.sh MeZO-SGD $task\
-                --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
-        done
-    done
+    # for task in SST2 MultiRC;do
+    #     for lr in 1e-07 1e-06;do
+    #         bash gaudi_scripts/run.sh MeZO-SGD $task\
+    #             --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
+    #     done
+    # done
+
+    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --seed 0
 
 elif [ $device -eq 1 ]; then
-    for task in RTE SQuAD;do
-        for lr in 1e-07 1e-06;do
-            bash gaudi_scripts/run.sh MeZO-SGD $task\
-                --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
-        done
-    done
+    # for task in RTE SQuAD;do
+    #     for lr in 1e-07 1e-06;do
+    #         bash gaudi_scripts/run.sh MeZO-SGD $task\
+    #             --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
+    #     done
+    # done
+
+    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --seed 1
 
 elif [ $device -eq 2 ]; then
-    for task in CB WIC;do
-        for lr in 1e-07 1e-06;do
-            bash gaudi_scripts/run.sh MeZO-SGD $task\
-                --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
-        done
-    done
+    # for task in CB WIC;do
+    #     for lr in 1e-07 1e-06;do
+    #         bash gaudi_scripts/run.sh MeZO-SGD $task\
+    #             --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
+    #     done
+    # done
+
+    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --seed 2
 
 elif [ $device -eq 3 ]; then
-    for task in BoolQ Copa;do
-        for lr in 1e-07 1e-06;do
-            bash gaudi_scripts/run.sh MeZO-SGD $task\
-                --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
-        done
-    done
+    # for task in BoolQ Copa;do
+    #     for lr in 1e-07 1e-06;do
+    #         bash gaudi_scripts/run.sh MeZO-SGD $task\
+    #             --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
+    #     done
+    # done
+
+    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --seed 3
 
 elif [ $device -eq 4 ]; then
-    for task in WSC ReCoRD;do
-        for lr in 1e-07 1e-06;do
-            bash gaudi_scripts/run.sh MeZO-SGD $task\
-                --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
-        done
-    done
+    # for task in WSC ReCoRD;do
+    #     for lr in 1e-07 1e-06;do
+    #         bash gaudi_scripts/run.sh MeZO-SGD $task\
+    #             --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
+    #     done
+    # done
+
+    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --seed 4
 
 elif [ $device -eq 5 ]; then
-    for task in DROP;do
-        for lr in 1e-07 1e-06;do
-            bash gaudi_scripts/run.sh MeZO-SGD $task\
-                --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
-        done
-    done
+    # for task in DROP;do
+    #     for lr in 1e-07 1e-06;do
+    #         bash gaudi_scripts/run.sh MeZO-SGD $task\
+    #             --learning_rate $lr --max_steps 10000 --momentum 0.0 --save_perturbations
+    #     done
+    # done
+
+    bash gaudi_scripts/run.sh MeZO-SGD SST2\
+        --learning_rate 1e-07 --max_steps 10000 --momentum --save_perturbations\
+        --seed 5
 
 elif [ $device -eq 6 ]; then
     for task in SST2 RTE CB BoolQ WSC WIC Copa MultiRC ReCoRD SQuAD;do
