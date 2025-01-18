@@ -1,0 +1,6 @@
+# pytorch==2.1.0
+transformers==4.28.1
+accelerate==0.17.1
+wandb
+scikit-learn
+datasets
