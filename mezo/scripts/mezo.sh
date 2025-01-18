@@ -1,4 +1,4 @@
-MODEL=${MODEL:-facebook/opt-1.3b}
+MODEL=${MODEL:-facebook/opt-13b}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
 
@@ -14,6 +14,7 @@ EVAL_STEPS=${EVAL_STEPS:-500}
 
 MODE=${MODE:-ft}
 TASK=${TASK:-SST2}
+TRAINER=${TRAINER:-zo-sgd}
 
 EXTRA_ARGS=""
 if [ "$MODE" == "prefix" ]; then
@@ -58,7 +59,7 @@ python run.py \
     --task_name $TASK \
     --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 1 \
     --max_steps $STEPS \
-    --trainer zo --load_float16 \
+    --trainer $TRAINER --load_float16 \
     --learning_rate $LR --zo_eps $EPS --per_device_train_batch_size $BS --lr_scheduler_type "constant" \
     --evaluation_strategy steps --save_strategy no \
     --eval_steps $EVAL_STEPS --save_steps $EVAL_STEPS \

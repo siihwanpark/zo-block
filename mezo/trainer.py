@@ -152,9 +152,13 @@ from transformers.utils import (
     logging,
 )
 from transformers.utils.generic import ContextManagers
+
+###############################################
 from utils import encode_prompt, Prediction
 from metrics import calculate_metric
 import torch.nn.functional as F
+from collections import defaultdict
+###############################################
 
 _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
 
@@ -393,6 +397,16 @@ class OurTrainer(Trainer):
         # self.model         is the Transformers Model
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model), etc.
 
+        if args.bcd:
+            self.init_block_coordinate_descent(
+                model=model,
+                base_optimizer=self.optimizer if "adam" in args.trainer else None,
+                block_ordering=args.bcd_order,
+                include_embedding=args.bcd_include_embedding,
+                include_lm_head=args.bcd_include_lm_head,
+                block_granularity=args.bcd_block_granularity,
+            )
+
         # Train!
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {num_examples}")
@@ -526,9 +540,15 @@ class OurTrainer(Trainer):
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
+                if args.bcd and (self.state.global_step % args.bcd_interval == 0):
+                    self.update_active_blocks(model=model, block_ordering=args.bcd_order)
+
                 # MeZO added: estimate gradient
-                if args.trainer == "zo":
-                    tr_loss_step = self.zo_step(model, inputs)
+                if "zo" in args.trainer:
+                    if args.lozo:
+                        tr_loss_step = self.lowrank_zo_step(model, inputs)
+                    else:
+                        tr_loss_step = self.zo_step(model, inputs)
                 else:
                     if (
                         ((step + 1) % args.gradient_accumulation_steps != 0)
@@ -563,8 +583,11 @@ class OurTrainer(Trainer):
                     and (step + 1) == steps_in_epoch
                 ):
                     # MeZO added: update model with the estimated gradient
-                    if args.trainer == "zo":
-                        self.zo_update(model)
+                    if  "zo" in args.trainer:
+                        if args.lozo:
+                            self.lowrank_zo_update(model)
+                        else:
+                            self.zo_update(model)
                     else:
                         # Gradient clipping
                         if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
@@ -825,9 +848,323 @@ class OurTrainer(Trainer):
                 param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
     
         self.lr_scheduler.step()
-        
+
         del self.z
         torch.cuda.empty_cache()
+
+    # =========================================== LOZO Functions ==============================================================
+    def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1):
+        """
+        Perturb the parameters with random vector uv^t.
+        """
+        args = self.args
+        step = self.step
+
+        if not args.save_perturbations:
+            torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+        
+        for name, param in self.named_parameters_to_optim:
+            if param.data.ndim >= 2:
+                if step % args.step_interval == 0:
+                    v = torch.randn(param.data.size(1), args.rank_r, device=param.data.device, dtype=param.data.dtype)
+                    self.v[name] = v
+                else:
+                    v = self.v[name]
+                
+                if args.save_perturbations:
+                    u = self.u[name]
+                else:
+                    u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
+                
+                param.data = param.data + scaling_factor * (u@v.t()) * self.args.zo_eps
+            else:
+                if args.save_perturbations:
+                    z = self.u[name]
+                else:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                
+                param.data = param.data + scaling_factor * z * self.args.zo_eps
+
+    def lowrank_zo_step(self, model, inputs):
+        """
+        Estimate gradient by Lowrank-zo. Return the loss from f(theta + uv^t)
+        """
+        args = self.args
+        if hasattr(self, 'step'):
+            self.step += 1
+        else:
+            self.step = 0
+            self.v = {}
+
+        self.named_parameters_to_optim = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.named_parameters_to_optim.append((name, param))
+
+        # Sample the random seed for sampling 
+        self.zo_random_seed = np.random.randint(1000000000)
+        if args.save_perturbations:
+            torch.manual_seed(self.zo_random_seed)
+            self.u = {}
+            for name, param in self.named_parameters_to_optim:
+                if param.data.ndim >= 2:
+                    self.u[name] = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
+                else:
+                    self.u[name] = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+
+        # First function evaluation
+        self.lowrank_zo_perturb_parameters(scaling_factor=1)
+        loss1 = self.zo_forward(model, inputs)
+
+        # Second function evaluation
+        self.lowrank_zo_perturb_parameters(scaling_factor=-2)
+        loss2 = self.zo_forward(model, inputs)
+
+        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+
+        # No gradient accumulation support
+        assert self.args.gradient_accumulation_steps == 1
+
+        # Reset model back to its parameters at start of step
+        self.lowrank_zo_perturb_parameters(scaling_factor=1)
+        return loss1
+
+
+    def lowrank_zo_update(self):
+        args = self.args
+
+        if not args.save_perturbations:
+            # Reset the random seed for sampling 
+            torch.manual_seed(self.zo_random_seed)     
+
+        for name, param in self.named_parameters_to_optim:
+            if param.data.ndim >= 2:
+                v = self.v[name]
+
+                if args.save_perturbations:
+                    u = self.u[name]
+                else:
+                    u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
+
+                if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                    param.data = param.data - self._get_learning_rate() * (self.projected_grad * (u@v.t()) + args.weight_decay * param.data)
+                else:
+                    param.data = param.data - self._get_learning_rate() * (self.projected_grad * (u@v.t()))
+            else:
+                # Resample z for bias
+                if args.save_perturbations:
+                    z = self.u[name]
+                else:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                
+                if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                    param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data)
+                else:
+                    param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
+
+        self.lr_scheduler.step()
+        if args.save_perturbations:
+            del self.u
+            torch.cuda.empty_cache()
+        
+    def random_gaussian_matrix(self, m, n, device, dtype, random_seed=None):
+        if random_seed is not None:
+            torch.manual_seed(random_seed)
+
+        random_matrix = torch.randn(m, n, device=device, dtype=dtype)
+        return random_matrix
+    
+    ############## Block Coordinate Descent functions ##############
+    def infer_param_groups(self, model, include_embedding=False, include_lm_head=False, block_granularity=1):
+        """automatic inference of the parameter groups based on the parameter names.
+        divide groups into:
+            * embedding
+            * transformer layers
+            * lm_head and others
+
+        Reference : https://github.com/Ledzy/BAdam/blob/12511504e53face3d2612f5bb4bac3a02afa817e/src/badam/block_optim.py#L143
+        """
+
+        block_prefix_list = []
+        lm_head_and_other_params = []
+        embed_pattern = r'.*embed[^.]*\.'
+        layer_pattern = r'.*layers.[^.]*\.'
+
+        # Fine-grained patterns for layers
+        query_pattern = r'.*layers.[^.]*\.self_attn\.q_proj'
+        key_pattern = r'.*layers.[^.]*\.self_attn\.k_proj'
+        value_pattern = r'.*layers.[^.]*\.self_attn\.v_proj'
+        out_proj_pattern = r'.*layers.[^.]*\.self_attn\.out_proj'
+        self_attn_layer_norm_pattern = r'.*layers.[^.]*\.self_attn_layer_norm'
+        fc1_pattern = r'.*layers.[^.]*\.fc1'
+        fc2_pattern = r'.*layers.[^.]*\.fc2'
+        final_layer_norm_pattern = r'.*layers.[^.]*\.final_layer_norm'
+
+        if block_granularity >= 1:
+            for name, _ in model.named_parameters():
+                if any(prefix[0] in name for prefix in block_prefix_list):
+                    continue
+                
+                if re.findall(layer_pattern, name):
+                    block_prefix_list.append(re.findall(layer_pattern, name))
+                elif re.findall(embed_pattern, name) and include_embedding:
+                    block_prefix_list.append(re.findall(embed_pattern, name))
+                else:
+                    lm_head_and_other_params.append(name)
+            
+            if include_lm_head:
+                block_prefix_list.append(lm_head_and_other_params)
+        else:
+            # Fine-grained grouping for each layer
+            current_layer = None
+            layer_group = {"qk":[], "vout":[], "norm_fc1":[], "fc2_norm":[]}
+
+            for name, _ in model.named_parameters():
+                # Check embedding parameters
+                if re.findall(embed_pattern, name) and include_embedding:
+                    block_prefix_list.append([name])
+
+                # Layer-wise grouping
+                elif re.match(layer_pattern, name):
+                    layer_idx = int(name.split(".")[3])  # Extract layer index
+
+                    # If a new layer starts, finalize the previous layer's group
+                    if current_layer is not None and layer_idx != current_layer:
+                        block_prefix_list.extend(list(layer_group.values()))
+                        layer_group = {"qk":[], "vout":[], "norm_fc1":[], "fc2_norm":[]}
+
+                    current_layer = layer_idx
+
+                    # Add fine-grained layer parameters
+                    if re.match(query_pattern, name) or re.match(key_pattern, name):
+                        layer_group["qk"].append(name)
+                    elif re.match(value_pattern, name) or re.match(out_proj_pattern, name):
+                        layer_group["vout"].append(name)
+                    elif re.match(self_attn_layer_norm_pattern, name) or re.match(fc1_pattern, name):
+                        layer_group["norm_fc1"].append(name)
+                    elif re.match(fc2_pattern, name) or re.match(final_layer_norm_pattern, name):
+                        layer_group["fc2_norm"].append(name)
+
+                # Check lm_head parameters
+                else:
+                    lm_head_and_other_params.append(name)
+
+            if layer_group:
+                block_prefix_list.extend(list(layer_group.values()))
+
+            # Add lm_head and other parameters at the end
+            if include_lm_head:
+                block_prefix_list.append(lm_head_and_other_params)
+        
+        return block_prefix_list
+    
+    def init_block_coordinate_descent(self, model, base_optimizer=None, block_ordering="random", active_modules=[], include_embedding=False, include_lm_head=False, block_granularity=1):
+        
+        self.active_modules = active_modules
+        self.block_prefix_list = self.infer_param_groups(model, include_embedding=include_embedding, include_lm_head=include_lm_head, block_granularity=block_granularity)
+        if block_granularity > 1:
+            assert isinstance(block_granularity, (int, float)) and block_granularity == int(block_granularity), "block_granularity should be an integer"
+            
+            merged_block_prefix_list = []
+            temp = []
+            
+            for i, block in enumerate(self.block_prefix_list):
+                temp.extend(block)
+                if (i+1) % block_granularity == 0:
+                    merged_block_prefix_list.append(temp)
+                    temp = []
+            
+            if temp:
+                merged_block_prefix_list.append(temp)
+            
+            self.block_prefix_list = merged_block_prefix_list
+        
+        self.block_num = len(self.block_prefix_list)
+
+        if block_ordering == "random":
+            self.block_order = torch.randperm(self.block_num).tolist()
+        elif block_ordering == "flip_flop":
+            self.block_order = list(range(self.block_num)) + list(range(self.block_num-2, 0, -1))
+        elif block_ordering == "randomized_flip_flop":
+            random_order = torch.randperm(self.block_num).tolist()
+            self.block_order = random_order + random_order[-2:0:-1] + random_order[:1]
+        elif block_ordering == "gauss_southwell":
+            raise ValueError(f"{block_ordering} is not implemented yet")
+        
+        if base_optimizer is not None:
+            self.block_optimizer_defaults = base_optimizer.defaults
+
+    def update_active_blocks(self, model, block_ordering="random"):
+        """
+        Update the active blocks for block coordinate descent and re-initialize the optimizer to flush the optimizer states.
+        """
+        assert hasattr(self, 'block_prefix_list') and hasattr(self, 'block_num'), "Block prefix list should be initialized properly."
+        if block_ordering == "random":
+            if len(self.block_order) == 0:
+                self.block_order = torch.randperm(self.block_num).tolist()
+                logger.info("Next block epoch's order has been updated")
+            self.current_block_idx = self.block_order.pop()
+        elif block_ordering == "ascending":
+            if hasattr(self, 'current_block_idx'):
+                self.current_block_idx = (self.current_block_idx + 1) % self.block_num
+            else:
+                self.current_block_idx = 0
+        elif block_ordering == "descending":
+            if hasattr(self, 'current_block_idx'):
+                self.current_block_idx = (self.current_block_idx - 1) % self.block_num
+            else:
+                self.current_block_idx = self.block_num - 1
+        elif block_ordering == "flip_flop":
+            if len(self.block_order) == 0:
+                self.block_order = list(range(self.block_num)) + list(range(self.block_num-2, 0, -1))
+                logger.info("Next block epoch's order has been updated")
+            self.current_block_idx = self.block_order.pop()
+        elif block_ordering == "randomized_flip_flop":
+            if len(self.block_order) == 0:
+                random_order = torch.randperm(self.block_num).tolist()
+                self.block_order = random_order + random_order[-2:0:-1] + random_order[:1]
+                logger.info("Next block epoch's order has been updated")
+            self.current_block_idx = self.block_order.pop()
+        elif block_ordering == "gauss_southwell":
+            raise ValueError(f"{block_ordering} is not implemented yet")
+        else:
+            raise ValueError(f"{block_ordering} is not a valid block ordering")
+
+        if hasattr(self, 'block_optimizer_defaults'):
+            trainable_param_groups = [
+                {
+                    'params': [],
+                    'weight_decay': self.optimizer.param_groups[0]['weight_decay'],
+                    **self.block_optimizer_defaults
+                },
+                {
+                    'params': [],
+                    "weight_decay": 0.0,
+                    **self.block_optimizer_defaults
+                }
+            ]
+
+        # Set param.requires_grad = False to every inactivated block
+        self.active_param_prefixs = self.block_prefix_list[self.current_block_idx] + self.active_modules
+        for name, param in model.named_parameters():
+            if not any(p in name for p in self.active_param_prefixs):
+                param.requires_grad_(False)
+                param.grad = None
+            else:
+                param.requires_grad_(True)
+                
+                if hasattr(self, 'block_optimizer_defaults'):
+                    if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                        trainable_param_groups[0]['params'].append(param)
+                    else:
+                        trainable_param_groups[1]['params'].append(param)
+
+        if hasattr(self, 'block_optimizer_defaults'):
+            # remove the empty param groups
+            trainable_param_groups[:] = [pg for pg in trainable_param_groups if len(pg["params"]) != 0]
+            self.optimizer.param_groups = trainable_param_groups
+            if self.args.state_flush:
+                self.optimizer.state = defaultdict(dict) # flush the optimizer state
 
     ############## Misc overload functions ##############
     def forward(self, input_ids, option_len=None, generation=False):

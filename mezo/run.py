@@ -55,7 +55,8 @@ class OurArguments(TrainingArguments):
     ## options
     ## - none: no training -- for zero-shot or in-context learning (ICL)
     ## - regular: regular huggingface trainer -- for fine-tuning
-    ## - zo: zeroth-order (MeZO) training
+    ## - zo-sgd: zeroth-order (MeZO) training with SGD
+    ## - zo-adam: zeroth-order (MeZO) training with Adam
     only_train_option: bool = True # whether to only train the option part of the input
     train_as_classification: bool = False # take the log likelihood of all options and train as classification 
 
@@ -108,6 +109,17 @@ class OurArguments(TrainingArguments):
     patience: int = 10
     save_perturbations: bool = False # save perturbations for MeZO
 
+    lozo: bool = False # whether to use LoZO
+    lozo_rank: int = 2 # rank for LoZO
+    lozo_interval: int = 50 # subspace update interval for LoZO
+
+    bcd: bool = False # whether to use BCD for MeZO
+    bcd_order: str = "random" # order of BCD; options: random, ascending, descending, filp_flop, randomized_flip_flop, gauss_southwell
+    bcd_interval: int = 100 # active block update interval
+    bcd_block_granularity: int = 1 # block granularity for BCD; 1 means block-wise, 2 means two blocks, etc.
+    bcd_include_embebdding: bool = True # whether to include embedding in BCD
+    bcd_include_lm_head: bool = True # whether to include LM head in BCD
+    state_flush: bool = True # whether to flush the state after each block update
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -478,6 +490,12 @@ def main():
     model_name = args.model_name.split('/')[-1].strip()
     run_name = f"{model_name}_{args.trainer}"
     run_name += f"_ft_{args.task_name}_lr_{args.learning_rate:.0e}_bsz_{args.per_device_train_batch_size}_steps_{args.max_steps}"
+
+    if args.lozo:
+        run_name += f"_lozo_{args.lozo_rank}_{args.lozo_interval}"
+    
+    if args.bcd:
+        run_name += f"_bcd_{args.bcd_order}_{args.bcd_interval}_{args.bcd_block_granularity}"
         
     wandb.login(key="726be770e2a351a53a5aab7e7f7772dfc603a233")
     wandb.init(project="mezo-original", name=run_name, config=args)
