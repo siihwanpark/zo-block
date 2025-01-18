@@ -1,9 +1,10 @@
 device=$1
 export CUDA_VISIBLE_DEVICES=$device
+export HF_HOME=/workspace
 
 if [ $device -eq 0 ];then
     for lr in 1e-07 1e-06;do
-        LR=$lr TASK=SST2 bash scripts/mezo.sh --early_stop
+        LR=$lr TASK=SST2 bash scripts/mezo.sh --early_stop --save_perturbations
     done
 
 elif [ $device -eq 1 ];then

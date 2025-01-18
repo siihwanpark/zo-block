@@ -706,11 +706,17 @@ class OurTrainer(Trainer):
         - scaling_factor: theta = theta + scaling_factor * z * eps
         """
 
-        # Set the random seed to ensure that we sample the same z for perturbation/update
-        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+        save = self.args.save_perturbations
+
+        if not save:
+            # Set the random seed to ensure that we sample the same z for perturbation/update
+            torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
         
         for name, param in self.named_parameters_to_optim:
-            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if save:
+                z = self.z[name]
+            else:
+                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             param.data = param.data + scaling_factor * z * self.args.zo_eps
 
 
@@ -770,6 +776,11 @@ class OurTrainer(Trainer):
 
         # Sample the random seed for sampling z
         self.zo_random_seed = np.random.randint(1000000000)
+        if args.save_perturbations:
+            torch.manual_seed(self.zo_random_seed)
+            self.z = {}
+            for name, param in self.named_parameters_to_optim:
+                self.z[name] = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
 
         # First function evaluation
         self.zo_perturb_parameters(scaling_factor=1)
@@ -794,21 +805,29 @@ class OurTrainer(Trainer):
         """
         Update the parameters with the estimated gradients.
         """
-        args = self.args
+        save = self.args.save_perturbations
+        weight_decay = self.args.weight_decay
 
-        # Reset the random seed for sampling zs
-        torch.manual_seed(self.zo_random_seed)     
+        if not save:
+            # Reset the random seed for sampling zs
+            torch.manual_seed(self.zo_random_seed)     
 
         for name, param in self.named_parameters_to_optim:
             # Resample z
-            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if save:
+                z = self.z[name]
+            else:
+                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            
             if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-                param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data)
+                param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + weight_decay * param.data)
             else:
                 param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
-
+    
         self.lr_scheduler.step()
-
+        
+        del self.z
+        torch.cuda.empty_cache()
 
     ############## Misc overload functions ##############
     def forward(self, input_ids, option_len=None, generation=False):

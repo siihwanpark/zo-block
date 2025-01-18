@@ -106,6 +106,7 @@ class OurArguments(TrainingArguments):
 
     early_stop: bool = False # Use early stopping
     patience: int = 10
+    save_perturbations: bool = False # save perturbations for MeZO
 
 
 def parse_args():
